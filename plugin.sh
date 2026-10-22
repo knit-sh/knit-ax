@@ -31,9 +31,9 @@ _knit_ax_driver_setup() { :; }
 knit_register_setup "_ax-driver" _knit_ax_driver_setup \
     "Internal: Ax BO environment (knit-ax private, not user-facing)."
 _knit_is_builtin
-# ax-platform>=0.4 is the target series for the ax_driver.py protocol (MB3).
-# The exact pin will be confirmed and tightened in MB3.
-knit_with_uv_specs "ax-platform>=0.4" "numpy"
+# ax_driver.py targets the AxClient service API (ax-platform>=0.4.0), which
+# has been stable across the 0.4→1.x→2.x lineage.
+knit_with_uv_specs "ax-platform>=0.4.0" "numpy"
 knit_done
 
 # ------------------------------------------------------------------------------
