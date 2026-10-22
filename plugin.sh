@@ -19,5 +19,90 @@
 
 knit_import uv
 
+# Enum type for the optimization sense (minimize / maximize).
+knit_enum "ax_sense" "minimize" "maximize"
+
+# Enum type for the on-failure policy (ignore / penalize).
+knit_enum "ax_on_failure" "ignore" "penalize"
+
+# Registration of the ax command group. Its subcommands (optimize, and future
+# ones) are registered lazily by _knit_ax_discover the first time any of them
+# is reached, so sourcing the plugin does not build the subtree up front.
 knit_register "ax" knit_empty "Ax Bayesian-optimization commands."
+knit_with_subcommand_discovery _knit_ax_discover
 knit_done
+
+# ------------------------------------------------------------------------------
+# @fn _knit_ax_discover()
+#
+# Register the ax subcommands. Called lazily the first time a subcommand is
+# resolved, listed in "--help", or walked by "describe".
+#
+# @param[in] parent The parent command's display name (unused).
+# ------------------------------------------------------------------------------
+_knit_ax_discover() {
+    knit_register "ax:optimize" _knit_ax_optimize \
+        "Run Bayesian optimization over a job or app's parameter space."
+    # Recorded options (auto-create columns in the optimizations table).
+    knit_with_optional "group:string" "" \
+        "Campaign label; recorded and forwarded to submitted jobs."
+    knit_with_optional "objective:string" "" \
+        "Which declared output to optimize; [table:]<output>. Inferred when the chain has exactly one output."
+    knit_with_optional "trials:integer" "" \
+        "Total trial budget."
+    knit_with_optional "parallel:integer" "1" \
+        "Max trials in flight (job mode only; app mode runs sequentially)."
+    knit_with_optional "seed:integer" "" \
+        "Ax RNG seed; recorded for reproducibility."
+    # Control-only options (parsed, validated, shown in help, but not stored).
+    knit_with_flag "minimize" \
+        "Minimize the objective (default)." --no-record
+    knit_with_flag "maximize" \
+        "Maximize the objective." --no-record
+    knit_with_optional "sobol-trials:integer" "" \
+        "Quasi-random exploration trials before the GP model engages." --no-record
+    knit_with_optional "resume:string" "" \
+        "Continue a prior optimization by its opt-id; with no id resumes the --group campaign." \
+        --no-record
+    knit_with_optional "on-failure:ax_on_failure" "ignore" \
+        "Drop failed trials from the model (ignore) or tell Ax a fixed penalty value (penalize)." \
+        --no-record
+    knit_with_optional "penalty:real" "" \
+        "Objective penalty applied to failed trials when --on-failure is penalize." \
+        --no-record
+    knit_with_dispatch "downstream" \
+        "A knit command (submit or run, with search-syntax values) to optimize over."
+    knit_with_table "optimizations"
+    # Programmatic output columns set by the body during the campaign.
+    knit_with_output "sense:ax_sense" "" \
+        "Optimization sense: minimize or maximize."
+    knit_with_output "status:string" "" \
+        "Campaign status: running, completed, or failed."
+    knit_with_output "best_id:string" "" \
+        "Row id of the best trial."
+    knit_with_output "best_objective:real" "" \
+        "Objective value of the best trial."
+    knit_done
+}
+
+# ------------------------------------------------------------------------------
+# @fn _knit_ax_optimize()
+#
+# Entry point for "ax optimize". Splits the downstream command off the first
+# "--" and fatals when no downstream is given. The Ax optimization loop will be
+# wired in later milestones.
+#
+# @param[in] ... All arguments as expanded by the CLI framework.
+# ------------------------------------------------------------------------------
+_knit_ax_optimize() {
+    local args=("$@")
+    local idx
+    idx=$(knit_extra_index "${args[@]}")
+    local -a downstream
+    downstream=("${args[@]:idx}")
+    if [[ ${#downstream[@]} -eq 0 ]]; then
+        knit_fatal \
+            "ax optimize: a downstream command is required after -- (e.g. \"-- submit -- <job> [OPTS]\")."
+    fi
+    # Optimization loop not yet implemented.
+}
