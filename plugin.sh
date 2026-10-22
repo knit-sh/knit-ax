@@ -19,6 +19,50 @@
 
 knit_import uv
 
+# ------------------------------------------------------------------------------
+# @fn _knit_ax_driver_setup()
+#
+# Setup body for the private _ax-driver uv environment. The uv directives
+# registered below install everything via their own before/after callbacks;
+# nothing extra is needed in the body.
+# ------------------------------------------------------------------------------
+_knit_ax_driver_setup() { :; }
+
+knit_register_setup "_ax-driver" _knit_ax_driver_setup \
+    "Internal: Ax BO environment (knit-ax private, not user-facing)."
+_knit_is_builtin
+# ax-platform>=0.4 is the target series for the ax_driver.py protocol (MB3).
+# The exact pin will be confirmed and tightened in MB3.
+knit_with_uv_specs "ax-platform>=0.4" "numpy"
+knit_done
+
+# ------------------------------------------------------------------------------
+# @fn _knit_ax_ensure_driver()
+#
+# Ensure the _ax-driver setup is built, building it on demand when the
+# instance directory does not exist yet. Stores the path to the built
+# instance directory in the caller-named variable.
+#
+# The build runs in a subshell so the venv activation from the uv
+# before-callback stays confined and does not leak into the dispatcher
+# process (which would spill into every trial).
+#
+# @param[out] __knit_ret  Name of the variable to hold the instance path.
+# @return 0 on success, non-zero on build failure.
+# ------------------------------------------------------------------------------
+_knit_ax_ensure_driver() {
+    local -n __knit_ret=$1
+    local prefix
+    prefix="$(knit_prefix)"
+    # Default setup root is <experiment_root>/setups; strip trailing /.knit
+    # from the prefix to recover the experiment root.
+    local driver_dir="${prefix%/.knit}/setups/_ax-driver"
+    if [[ ! -d "${driver_dir}" ]]; then
+        ( knit setup --name _ax-driver -- _ax-driver ) || return 1
+    fi
+    __knit_ret="${driver_dir}"
+}
+
 # Enum type for the optimization sense (minimize / maximize).
 knit_enum "ax_sense" "minimize" "maximize"
 

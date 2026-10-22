@@ -14,12 +14,24 @@
 # transitive "knit_import uv" inside plugin.sh defers gracefully without
 # touching the network (unit tests have no .knit directory and need no live uv
 # environment). Skips when KNIT_SH is unusable.
+#
+# Set KNIT_UV_SH to the knit-uv plugin.sh path to load uv directives
+# (knit_with_uv_specs, etc.) before the plugin is sourced. This is required
+# for tests that verify uv-backed setup registration (_ax-driver columns,
+# etc.); without it those tests should skip.
 knit_ax_test_load() {
     if [[ -z "${KNIT_SH:-}" || ! -r "${KNIT_SH}" ]]; then
         skip "set KNIT_SH to a readable knit.sh build with Phase-A search-core API"
     fi
     # shellcheck disable=SC1090
     source "${KNIT_SH}"
+    # Source the uv plugin directly when available so knit_with_uv_specs is
+    # defined even though KNIT_OFFLINE=1 below would defer the transitive
+    # knit_import uv inside plugin.sh.
+    if [[ -n "${KNIT_UV_SH:-}" && -r "${KNIT_UV_SH}" ]]; then
+        # shellcheck disable=SC1090
+        source "${KNIT_UV_SH}"
+    fi
     KNIT_OFFLINE=1
     # shellcheck disable=SC1091
     source "${BATS_TEST_DIRNAME}/../plugin.sh"
