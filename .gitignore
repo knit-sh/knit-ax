@@ -1,0 +1,5 @@
+# Local knit.sh build used by the test suite (point KNIT_SH at it instead).
+knit.sh
+*.swp
+__pycache__/
+*.pyc
