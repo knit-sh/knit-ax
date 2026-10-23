@@ -71,12 +71,31 @@ teardown() {
 }
 
 @test "_knit_ax_ensure_driver builds the instance when it is absent" {
-    # Point _KNIT_PREFIX at a fresh experiment tree (no instance yet) and
-    # confirm that _knit_ax_ensure_driver creates it on demand and returns the
-    # correct path. With uv deferred in unit tests the setup body is a no-op,
-    # but the directory and path mechanics are fully exercised.
+    command -v knit_with_uv_env >/dev/null 2>&1 \
+        || skip "uv directives not available; set KNIT_UV_SH to knit-uv/plugin.sh"
+    # Point _KNIT_PREFIX at a fresh experiment tree (no instance yet) and confirm
+    # that _knit_ax_ensure_driver creates it on demand and returns the correct
+    # path, exercising the absent -> "knit setup" -> dir-created path.
     local saved_prefix="${_KNIT_PREFIX}"
     _KNIT_PREFIX="${_KNIT_TEST_TMPDIR}/ondemand/.knit"
+
+    # Keep the build light and hermetic. A real _ax-driver build would provision
+    # uv (a network download that itself needs jq) and run "uv sync" to install
+    # Ax — neither of which belongs in a unit test. Pre-create the uv tool dir so
+    # knit_env_ensure_provisioned short-circuits (no download), and stub the uv
+    # env verbs so the "build" only lays down the directory, manifest, and lock
+    # the setup dispatcher records. The subshell "knit setup" runs in inherits
+    # these overrides. (NOTE: offline alone does not suffice — KNIT_OFFLINE=1
+    # defers only the knit_import uv import, not the setup's uv-env build.)
+    mkdir -p "${_KNIT_PREFIX}/uv"
+    knit_uv_install_env() {
+        local env_dir="$1" manifest="$2"
+        mkdir -p "${env_dir}"
+        cp "${manifest}" "${env_dir}/pyproject.toml" 2>/dev/null || :
+        printf 'version = 1\n' > "${env_dir}/uv.lock"
+    }
+    knit_uv_activation() { :; }
+
     local result
     _knit_ax_ensure_driver result
     _KNIT_PREFIX="${saved_prefix}"
