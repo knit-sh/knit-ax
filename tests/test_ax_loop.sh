@@ -2,7 +2,7 @@
 #
 # MB6 tests: the ask/tell loop wiring. The Ax coprocess is stubbed at the single
 # RPC seam (_knit_ax_rpc), so these exercise the proposer logic — line
-# reconstruction, ask, observe, and the optimize-time validations — without a
+# reconstruction, ask, observe, and the prepare-time validations — without a
 # live Ax process or scheduler. End-to-end convergence lives in MB8.
 
 load helper
@@ -139,30 +139,32 @@ _capture_rpc() { _knit_ax_rpc() { local -n __r=$1; _TEST_REQ="$2"; __r='{"status
     [ "$status" -eq 0 ]
 }
 
-# ---------- optimize-time validations (no coprocess reached) ----------
+# ---------- prepare-time validations (no coprocess reached) ----------
+# The OPTIMIZE ARGS and their validation moved from the old single "optimize"
+# dispatcher onto "ax prepare", which fails fast before any campaign is written.
 
-@test "optimize fatals without --objective" {
-    run knit ax optimize --trials 5 -- submit -- train --lr @sweep
+@test "prepare fatals without --objective" {
+    run knit ax prepare --campaign c1 --trials 5 -- submit -- train --lr @sweep
     [ "$status" -ne 0 ]
     [[ "$output" == *"objective"* ]]
 }
 
-@test "optimize fatals without --trials" {
-    run knit ax optimize --objective val_loss -- submit -- train --lr @sweep
+@test "prepare fatals without --trials" {
+    run knit ax prepare --campaign c1 --objective val_loss -- submit -- train --lr @sweep
     [ "$status" -ne 0 ]
     [[ "$output" == *"trials"* ]]
 }
 
-@test "optimize rejects --parallel > 1 in app mode" {
-    run knit ax optimize --objective throughput --trials 5 --parallel 2 \
+@test "prepare rejects --parallel > 1 in app mode" {
+    run knit ax prepare --campaign c1 --objective throughput --trials 5 --parallel 2 \
         -- run --procs 4 -- bench --msg-size @sweep
     [ "$status" -ne 0 ]
     [[ "$output" == *"parallel"* ]]
     [[ "$output" == *"app mode"* ]]
 }
 
-@test "optimize rejects a non-submit/run downstream" {
-    run knit ax optimize --objective z --trials 5 -- somebare --x @sweep
+@test "prepare rejects a non-submit/run downstream" {
+    run knit ax prepare --campaign c1 --objective z --trials 5 -- somebare --x @sweep
     [ "$status" -ne 0 ]
     [[ "$output" == *"submit"* ]]
     [[ "$output" == *"run"* ]]

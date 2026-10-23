@@ -112,6 +112,18 @@ class AxDriver:
     def _send(self, msg: dict) -> None:
         _emit(msg)
 
+    def _n_trials(self) -> int:
+        """Total trials in the experiment (asked = completed + pending + failed).
+
+        This is the count the knit loop measures its budget against: on resume it
+        is how many trials have already been launched, so the caller runs only the
+        remaining budget.
+        """
+        try:
+            return len(self._client.experiment.trials)
+        except Exception:
+            return 0
+
     def _rebuild_observations(self) -> None:
         """Repopulate _observations from a freshly loaded experiment."""
         self._observations = {}
@@ -164,7 +176,7 @@ class AxDriver:
             choose_generation_strategy_kwargs=gen_kwargs if gen_kwargs else None,
         )
         self._observations = {}
-        self._send({"status": "ok"})
+        self._send({"status": "ok", "n_trials": 0})
 
     def cmd_resume(self, req: dict) -> None:
         path = req["path"]
@@ -176,7 +188,7 @@ class AxDriver:
             self._obj_name = opt_cfg.objective.metric.name
             self._minimize = bool(opt_cfg.objective.minimize)
         self._rebuild_observations()
-        self._send({"status": "ok"})
+        self._send({"status": "ok", "n_trials": self._n_trials()})
 
     def cmd_ask(self, req: dict) -> None:
         n = int(req.get("n", 1))
@@ -219,7 +231,7 @@ class AxDriver:
 
     def cmd_best(self, _req: dict) -> None:
         if not self._observations:
-            self._send({"best": None})
+            self._send({"best": None, "n_trials": self._n_trials()})
             return
         best_idx = min(
             self._observations,
@@ -235,7 +247,8 @@ class AxDriver:
                 "index": best_idx,
                 "params": params,
                 "objective": obj_val,
-            }
+            },
+            "n_trials": self._n_trials(),
         })
 
     def cmd_save(self, req: dict) -> None:

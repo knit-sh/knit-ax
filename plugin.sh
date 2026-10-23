@@ -24,6 +24,101 @@ _KNIT_AX_PLUGIN_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 knit_import uv
 
+# A campaign lives on disk under <experiment>/campaigns/<name>/ (a sibling of
+# setups/ and jobs/), so it is portable and reproducible. Declare that tree for
+# "knit bundle". The glob form (rather than a bare "campaigns") is deliberate: a
+# literal required path that does not exist is fatal at bundle time, which would
+# break "knit bundle" for an experiment that imports ax but has prepared no
+# campaign yet; a glob that matches nothing only warns.
+knit_bundle_requires "campaigns/*"
+
+# ------------------------------------------------------------------------------
+# @fn _knit_ax_campaigns_root()
+#
+# Store the absolute path of the experiment's campaigns directory
+# (<experiment_root>/campaigns) in the caller-named variable. The default knit
+# prefix is <experiment_root>/.knit, so stripping the trailing /.knit recovers
+# the experiment root the campaigns tree sits beside.
+#
+# @param[out] __knit_ret Name of the variable to hold the campaigns root path.
+# ------------------------------------------------------------------------------
+_knit_ax_campaigns_root() {
+    local -n __knit_ret=$1
+    local prefix
+    prefix="$(knit_prefix)"
+    __knit_ret="${prefix%/.knit}/campaigns"
+}
+
+# ------------------------------------------------------------------------------
+# @fn _knit_ax_campaign_dir()
+#
+# Store the absolute path of one campaign's directory
+# (<experiment_root>/campaigns/<name>) in the caller-named variable.
+#
+# @param[out] __knit_ret Name of the variable to hold the campaign directory.
+# @param[in] name The campaign name.
+# ------------------------------------------------------------------------------
+_knit_ax_campaign_dir() {
+    local -n __knit_ret=$1
+    local name="$2"
+    local root
+    _knit_ax_campaigns_root root
+    __knit_ret="${root}/${name}"
+}
+
+# ------------------------------------------------------------------------------
+# @fn _knit_ax_campaign_progress()
+#
+# Read a campaign's recorded progress from its on-disk result.json (written by
+# "ax optimize" at the end of each run): the number of trials done and the best
+# objective value so far. Both outputs are empty when the campaign has no
+# result.json yet (prepared but never run). "ax list" and "ax show" read this
+# rather than the database, so they need no Ax process and no SQL.
+#
+# @param[out] __knit_ret1 Trials done so far (empty when unknown).
+# @param[out] __knit_ret2 Best objective value so far (empty when unknown).
+# @param[in] name The campaign name.
+# ------------------------------------------------------------------------------
+_knit_ax_campaign_progress() {
+    local -n __knit_ret1=$1
+    local -n __knit_ret2=$2
+    local name="$3"
+    __knit_ret1=""
+    __knit_ret2=""
+    local dir
+    _knit_ax_campaign_dir dir "${name}"
+    local result="${dir}/result.json"
+    [[ -f "${result}" ]] || return 0
+    local json
+    json="$(<"${result}")"
+    __knit_ret1=$(knit_jq -r '.trials_done // ""' <<<"${json}")
+    __knit_ret2=$(knit_jq -r '.best.objective // ""' <<<"${json}")
+}
+
+# ------------------------------------------------------------------------------
+# @fn _knit_ax_mode_from_downstream()
+#
+# Resolve the search-loop mode from the downstream command line's dispatcher:
+# "submit"/"prepare" run one scheduler job per trial (job mode), "run" runs one
+# app per trial inside the current allocation (app mode). Any other leading
+# dispatcher is a fatal. Stores "job" or "app" in the caller-named variable.
+#
+# @param[out] __knit_ret Name of the variable to hold the mode ("job"/"app").
+# @param[in] ... The downstream tokens (after the outer "--").
+# ------------------------------------------------------------------------------
+_knit_ax_mode_from_downstream() {
+    local -n __knit_ret=$1
+    shift
+    # shellcheck disable=SC2034 # mangled/target are unused here; only dispatcher
+    local mangled dispatcher target
+    knit_search_resolve_target mangled dispatcher target "$@"
+    case "${dispatcher}" in
+        submit|prepare) __knit_ret="job" ;;
+        run)            __knit_ret="app" ;;
+        *) knit_fatal "ax: the downstream must be a 'submit' or 'run' line (got '%s')." "${dispatcher}" ;;
+    esac
+}
+
 # ------------------------------------------------------------------------------
 # @fn _knit_ax_driver_setup()
 #
@@ -74,9 +169,9 @@ knit_enum "ax_sense" "minimize" "maximize"
 # Enum type for the on-failure policy (ignore / penalize).
 knit_enum "ax_on_failure" "ignore" "penalize"
 
-# Registration of the ax command group. Its subcommands (optimize, and future
-# ones) are registered lazily by _knit_ax_discover the first time any of them
-# is reached, so sourcing the plugin does not build the subtree up front.
+# Registration of the ax command group. Its subcommands (prepare, optimize,
+# list, show) are registered lazily by _knit_ax_discover the first time any of
+# them is reached, so sourcing the plugin does not build the subtree up front.
 knit_register "ax" knit_empty "Ax Bayesian-optimization commands."
 knit_with_subcommand_discovery _knit_ax_discover
 knit_done
@@ -85,34 +180,44 @@ knit_done
 # @fn _knit_ax_discover()
 #
 # Register the ax subcommands. Called lazily the first time a subcommand is
-# resolved, listed in "--help", or walked by "describe".
+# resolved, listed in "--help", or walked by "describe". The surface is a
+# prepare -> optimize split over first-class, named, on-disk campaigns, mirroring
+# knit's own prepare -> submit drain: "ax prepare" defines and records a campaign
+# (running nothing), "ax optimize" starts or resumes its ask/tell loop, and
+# "ax list" / "ax show" report status. A campaign is addressed by --campaign
+# <name> and stored under campaigns/<name>/.
 #
 # @param[in] parent The parent command's display name (unused).
 # ------------------------------------------------------------------------------
 _knit_ax_discover() {
-    knit_register "ax:optimize" _knit_ax_optimize \
-        "Run Bayesian optimization over a job or app's parameter space."
+    # --- ax prepare: define and record a campaign (runs no trials) -----------
+    knit_register "ax:prepare" _knit_ax_prepare \
+        "Define and record a Bayesian-optimization campaign (runs no trials)."
+    # prepare records the campaign's "optimizations" data row (its id is the
+    # campaign name) but is transparent to the provenance graph: the trials that
+    # "ax optimize" launches later carry the only call edges into that node.
+    knit_without_provenance
+    # The campaign identity and the trial-job group stamp (jobs.group = <name>).
+    # Unique: prepare fatals if campaigns/<name>/ already exists. Recorded.
+    knit_with_required "campaign:string" \
+        "Campaign name: the campaigns/<name>/ directory and the trial-job group stamp (must be unique)."
     # Recorded options (auto-create columns in the optimizations table).
-    knit_with_optional "group:string" "" \
-        "Campaign label; recorded and forwarded to submitted jobs."
     knit_with_optional "objective:string" "" \
-        "Which declared output to optimize; [table:]<output>. Inferred when the chain has exactly one output."
+        "Which declared output to optimize; [table:]<output>."
     knit_with_optional "trials:integer" "" \
         "Total trial budget."
     knit_with_optional "parallel:integer" "1" \
         "Max trials in flight (job mode only; app mode runs sequentially)."
     knit_with_optional "seed:integer" "" \
         "Ax RNG seed; recorded for reproducibility."
-    # Control-only options (parsed, validated, shown in help, but not stored).
+    # Control-only options (parsed, validated, shown in help, stored in the
+    # campaign's definition.json rather than as table columns).
     knit_with_flag "minimize" \
         "Minimize the objective (default)." --no-record
     knit_with_flag "maximize" \
         "Maximize the objective." --no-record
     knit_with_optional "sobol-trials:integer" "" \
         "Quasi-random exploration trials before the GP model engages." --no-record
-    knit_with_optional "resume:string" "" \
-        "Continue a prior optimization by its opt-id; with no id resumes the --group campaign." \
-        --no-record
     knit_with_optional "on-failure:ax_on_failure" "ignore" \
         "Drop failed trials from the model (ignore) or tell Ax a fixed penalty value (penalize)." \
         --no-record
@@ -122,31 +227,62 @@ _knit_ax_discover() {
     knit_with_dispatch "downstream" \
         "A knit command (submit or run, with search-syntax values) to optimize over."
     knit_with_table "optimizations"
-    # Programmatic output columns set by the body during the campaign.
+    # Programmatic output columns: set at prepare (sense/status) and updated by
+    # "ax optimize" on the same row as the campaign progresses.
     knit_with_output "sense:ax_sense" "" \
         "Optimization sense: minimize or maximize."
     knit_with_output "status:string" "" \
-        "Campaign status: running, completed, or failed."
+        "Campaign status: prepared, running, completed, or failed."
     knit_with_output "best_id:string" "" \
         "Row id of the best trial."
     knit_with_output "best_objective:real" "" \
         "Objective value of the best trial."
     knit_done
+
+    # --- ax optimize: start or resume the loop for a prepared campaign -------
+    knit_register "ax:optimize" _knit_ax_optimize \
+        "Start or resume Bayesian optimization for a prepared campaign."
+    # A control command: it re-attaches to the campaign's existing optimizations
+    # row (it records no row of its own), so it stays out of the provenance graph.
+    knit_without_provenance
+    knit_with_required "campaign:string" \
+        "The campaign to run or resume (its campaigns/<name>/ directory must exist)."
+    knit_done
+
+    # --- ax list: one line per campaign --------------------------------------
+    knit_register "ax:list" _knit_ax_list \
+        "List Bayesian-optimization campaigns."
+    knit_without_provenance
+    knit_with_flag "verbose" \
+        "Also show each campaign's objective and command." --no-record
+    knit_done
+
+    # --- ax show: one campaign's detail --------------------------------------
+    knit_register "ax:show" _knit_ax_show \
+        "Show one Bayesian-optimization campaign's detail."
+    knit_without_provenance
+    knit_with_required "campaign:string" \
+        "The campaign to show."
+    knit_done
 }
 
 # ------------------------------------------------------------------------------
-# @fn _knit_ax_optimize()
+# @fn _knit_ax_prepare()
 #
-# Entry point for "ax optimize". Resolves the objective and the search space,
-# starts the Ax driver as a coprocess (with its venv activation confined to the
-# coprocess subshell), and drives the shared search-core loop: each trial is
-# proposed by Ax (ask), launched by the loop, read back (collect), and reported
-# to Ax (observe). The downstream dispatcher picks the loop mode — "submit" /
-# "prepare" run in job mode, "run" in app mode.
+# Entry point for "ax prepare". Validates the request, resolves the objective and
+# builds the Ax search-space spec eagerly (so a bad objective or an empty space
+# fails now, not at run time), then writes the campaign to disk under
+# campaigns/<name>/ and records its "optimizations" row. It runs no trials. The
+# campaign name is unique: a pre-existing campaigns/<name>/ is a fatal.
+#
+# The downstream line and every knob are persisted in definition.json, the
+# portable source of truth that "ax optimize" replays. The row's id is the
+# campaign name (set with knit_set_row_id), so "ax optimize" can re-attach to the
+# same row by id and the trials can call-edge to it.
 #
 # @param[in] ... All arguments as expanded by the CLI framework.
 # ------------------------------------------------------------------------------
-_knit_ax_optimize() {
+_knit_ax_prepare() {
     local args=("$@")
     local idx
     idx=$(knit_extra_index "${args[@]}")
@@ -154,45 +290,142 @@ _knit_ax_optimize() {
     downstream=("${args[@]:idx}")
     if [[ ${#downstream[@]} -eq 0 ]]; then
         knit_fatal \
-            "ax optimize: a downstream command is required after -- (e.g. \"-- submit -- <job> [OPTS]\")."
+            "ax prepare: a downstream command is required after -- (e.g. \"-- submit -- <job> [OPTS]\")."
     fi
 
     # --- options ---
-    local objective maximize_flag seed sobol trials parallel group
+    local campaign objective maximize_flag seed sobol trials parallel
+    local on_failure penalty
+    campaign=$(knit_get_parameter "campaign" "${args[@]}")
     objective=$(knit_get_parameter "objective" "${args[@]}")     || objective=""
     maximize_flag=$(knit_get_parameter "maximize" "${args[@]}")  || maximize_flag="false"
     seed=$(knit_get_parameter "seed" "${args[@]}")               || seed=""
     sobol=$(knit_get_parameter "sobol-trials" "${args[@]}")      || sobol=""
     trials=$(knit_get_parameter "trials" "${args[@]}")           || trials=""
     parallel=$(knit_get_parameter "parallel" "${args[@]}")       || parallel="1"
-    # group/on_failure/penalty are read by the ask/observe callbacks via dynamic
-    # scope (the search-core proposer state contract).
-    # shellcheck disable=SC2034
-    group=$(knit_get_parameter "group" "${args[@]}")             || group=""
-    # shellcheck disable=SC2034
-    local on_failure penalty
-    # shellcheck disable=SC2034
     on_failure=$(knit_get_parameter "on-failure" "${args[@]}")   || on_failure="ignore"
-    # shellcheck disable=SC2034
     penalty=$(knit_get_parameter "penalty" "${args[@]}")         || penalty=""
 
-    [[ -z "${objective}" ]] && knit_fatal "ax optimize: --objective is required."
-    [[ -z "${trials}" ]] && knit_fatal "ax optimize: --trials is required (the BO trial budget)."
+    [[ -z "${objective}" ]] && knit_fatal "ax prepare: --objective is required."
+    [[ -z "${trials}" ]] && knit_fatal "ax prepare: --trials is required (the BO trial budget)."
 
     local minimize="true"
     [[ "${maximize_flag}" == "true" ]] && minimize="false"
+    local sense="minimize"
+    [[ "${minimize}" == "false" ]] && sense="maximize"
 
-    # --- loop mode from the downstream dispatcher ---
-    local mangled dispatcher target
-    knit_search_resolve_target mangled dispatcher target "${downstream[@]}"
+    # --- loop mode (for the app-mode --parallel guard; fail fast at prepare) ---
     local mode
-    case "${dispatcher}" in
-        submit|prepare) mode="job" ;;
-        run)            mode="app" ;;
-        *) knit_fatal "ax optimize: the downstream must be a 'submit' or 'run' line (got '%s')." "${dispatcher}" ;;
-    esac
+    _knit_ax_mode_from_downstream mode "${downstream[@]}"
     if [[ "${mode}" == "app" ]] && (( parallel > 1 )); then
-        knit_fatal "ax optimize: --parallel > 1 is not supported in app mode (app trials share one allocation); use --parallel 1."
+        knit_fatal "ax prepare: --parallel > 1 is not supported in app mode (app trials share one allocation); use --parallel 1."
+    fi
+
+    # --- resolve the objective and build the spec now, so errors surface here ---
+    # shellcheck disable=SC2034 # obj_table/obj_column prove the objective resolves
+    local obj_table obj_column
+    _knit_ax_resolve_objective obj_table obj_column "${objective}" "${downstream[@]}"
+    local spec
+    spec=$(_knit_ax_build_spec_json "${objective}" "${minimize}" "${seed}" \
+        "${sobol}" "${downstream[@]}") || exit $?
+
+    # --- create the campaign directory (no-clobber) ---
+    local dir
+    _knit_ax_campaign_dir dir "${campaign}"
+    if [[ -e "${dir}" ]]; then
+        knit_fatal "ax prepare: campaign '%s' already exists (%s); choose another --campaign name." \
+            "${campaign}" "${dir}"
+    fi
+    mkdir -p "${dir}" \
+        || knit_fatal "ax prepare: could not create campaign directory '%s'." "${dir}"
+
+    # --- write the portable definition and the status marker ---
+    knit_jq -n \
+        --arg  campaign  "${campaign}" \
+        --arg  objective "${objective}" \
+        --argjson minimize "${minimize}" \
+        --arg  sense     "${sense}" \
+        --argjson trials   "${trials}" \
+        --argjson parallel "${parallel}" \
+        --argjson seed     "${seed:-null}" \
+        --argjson sobol    "${sobol:-null}" \
+        --arg  on_failure "${on_failure}" \
+        --argjson penalty  "${penalty:-null}" \
+        --arg  opt_id    "${campaign}" \
+        '{campaign:$campaign, objective:$objective, minimize:$minimize,
+          sense:$sense, trials:$trials, parallel:$parallel, seed:$seed,
+          sobol_trials:$sobol, on_failure:$on_failure, penalty:$penalty,
+          downstream:$ARGS.positional, opt_id:$opt_id}' \
+        --args "${downstream[@]}" > "${dir}/definition.json"
+    printf 'prepared\n' > "${dir}/status"
+
+    # --- record the optimizations row under the campaign id ---
+    # The campaign name is the row id (and the opt-id), so "ax optimize" can
+    # re-attach to this row and the trials can call-edge to it. campaign /
+    # objective / trials / parallel / seed are auto-recorded from the options
+    # above; sense and status are set here.
+    knit_set_row_id "${campaign}"
+    knit_output "sense" "${sense}"
+    knit_output "status" "prepared"
+
+    knit_info "ax prepare: campaign '%s' prepared (%s trials, objective '%s', %s)." \
+        "${campaign}" "${trials}" "${objective}" "${sense}"
+}
+
+# ------------------------------------------------------------------------------
+# @fn _knit_ax_optimize()
+#
+# Entry point for "ax optimize". Reads a prepared campaign's definition, starts
+# the Ax driver as a coprocess (with its venv activation confined to the
+# coprocess subshell), and drives the shared search-core loop: each trial is
+# proposed by Ax (ask), launched by the loop, read back (collect), and reported
+# to Ax (observe). The first call and every resume are the same operation — the
+# loop runs from wherever the campaign's state.json sits (0 trials the first
+# time, K later), for the remaining budget. At budget it is a no-op.
+#
+# The campaign's optimizations row is updated in place (by the campaign id, with
+# knit_db_update_row) as the run progresses: status running -> completed/failed,
+# plus best_id/best_objective. Each trial carries an automatic "call" edge from
+# that row, stamped through the public KNIT_SOURCE_ID / KNIT_SOURCE_COMMAND
+# context (ax optimize records no row of its own and is transparent to the graph,
+# so the campaign node is the trials' in-graph source).
+#
+# @param[in] ... All arguments as expanded by the CLI framework.
+# ------------------------------------------------------------------------------
+_knit_ax_optimize() {
+    local campaign
+    campaign=$(knit_get_parameter "campaign" "$@")
+
+    local dir
+    _knit_ax_campaign_dir dir "${campaign}"
+    if [[ ! -d "${dir}" ]]; then
+        knit_fatal "ax optimize: no campaign '%s' (%s). Run 'ax prepare --campaign %s -- <downstream>' first." \
+            "${campaign}" "${dir}" "${campaign}"
+    fi
+    local deffile="${dir}/definition.json"
+    [[ -f "${deffile}" ]] \
+        || knit_fatal "ax optimize: campaign '%s' has no definition.json." "${campaign}"
+
+    # --- read back the stored definition ---
+    local def
+    def="$(<"${deffile}")"
+    local objective minimize trials parallel seed sobol
+    # on_failure / penalty are read by _knit_ax_observe via dynamic scope.
+    # shellcheck disable=SC2034
+    local on_failure penalty
+    IFS=$'\t' read -r objective minimize trials parallel seed sobol on_failure penalty \
+        < <(knit_jq -r '[ .objective, (.minimize|tostring), (.trials|tostring),
+                          (.parallel|tostring), ((.seed // "")|tostring),
+                          ((.sobol_trials // "")|tostring), .on_failure,
+                          ((.penalty // "")|tostring) ] | @tsv' <<<"${def}")
+    local -a downstream
+    mapfile -t downstream < <(knit_jq -r '.downstream[]' <<<"${def}")
+
+    # --- loop mode ---
+    local mode
+    _knit_ax_mode_from_downstream mode "${downstream[@]}"
+    if [[ "${mode}" == "app" ]] && (( parallel > 1 )); then
+        knit_fatal "ax optimize: --parallel > 1 is not supported in app mode; re-prepare the campaign with --parallel 1."
     fi
 
     # --- objective table/column (read by _knit_ax_collect via dynamic scope) ---
@@ -201,7 +434,7 @@ _knit_ax_optimize() {
     _knit_ax_resolve_objective _knit_ax_obj_table _knit_ax_obj_column \
         "${objective}" "${downstream[@]}"
 
-    # --- search-space spec (MB4); a bad objective/space fatals in the subshell ---
+    # --- search-space spec (used on a fresh campaign's init) ---
     local spec
     spec=$(_knit_ax_build_spec_json "${objective}" "${minimize}" "${seed}" \
         "${sobol}" "${downstream[@]}") || exit $?
@@ -214,8 +447,6 @@ _knit_ax_optimize() {
     knit_search_scan template axes rawtokens seen_map "" "${downstream[@]}"
     local -A slot_by_param=()
     local ax_i ax_kind ax_slot ax_name
-    # slot_by_param is consumed by _knit_ax_ask through dynamic scope, which the
-    # linter cannot see; suppress the unused-variable warning on the fill loop.
     # shellcheck disable=SC2034
     for ((ax_i=0; ax_i<${#axes[@]}; ax_i++)); do
         read -r ax_kind ax_slot ax_name <<< "${axes[ax_i]}"
@@ -224,6 +455,13 @@ _knit_ax_optimize() {
         esac
     done
 
+    # The campaign name is the trial-job group stamp (read by _knit_ax_ask).
+    # shellcheck disable=SC2034
+    local group="${campaign}"
+    # Trial index -> child row id, filled by _knit_ax_observe (dynamic scope) and
+    # read after the loop to record best_id (Ax's "best" gives only its own index).
+    local -A _knit_ax_trial_row=()
+
     # --- start the Ax coprocess (activation confined to its subshell) ---
     local driver_prefix
     _knit_ax_ensure_driver driver_prefix \
@@ -231,24 +469,193 @@ _knit_ax_optimize() {
     _knit_ax_start_driver "${driver_prefix}"
     trap '_knit_ax_shutdown' EXIT
 
-    # init the driver with the search-space spec
-    local init_req resp
-    init_req=$(knit_jq -cn --argjson spec "${spec}" '{cmd:"init",spec:$spec}')
-    _knit_ax_rpc resp "${init_req}"
+    # --- init a fresh campaign, or resume from its persisted state ---
+    local state_path="${dir}/state.json"
+    local resp done_trials
+    if [[ -f "${state_path}" ]]; then
+        local resume_req
+        resume_req=$(knit_jq -cn --arg p "${state_path}" \
+            '{cmd:"resume",path:$p,state_path:$p}')
+        _knit_ax_rpc resp "${resume_req}"
+    else
+        local init_req
+        init_req=$(knit_jq -cn --argjson spec "${spec}" --arg sp "${state_path}" \
+            '{cmd:"init",spec:$spec,state_path:$sp}')
+        _knit_ax_rpc resp "${init_req}"
+    fi
+    done_trials=$(knit_jq -r '.n_trials // 0' <<<"${resp}")
 
-    # --- drive the shared search-core loop ---
+    # --- already at budget: nothing to do ---
+    if (( done_trials >= trials )); then
+        knit_info "ax optimize: campaign '%s' already at budget (%s/%s); nothing to do." \
+            "${campaign}" "${done_trials}" "${trials}"
+        _knit_ax_finish "${dir}" "${campaign}" "completed" "${done_trials}"
+        _knit_ax_shutdown
+        trap - EXIT
+        return 0
+    fi
+    local remaining=$(( trials - done_trials ))
+
+    printf 'running\n' > "${dir}/status"
+    knit_db_update_row "optimizations" "${campaign}" "status=running"
+
+    # --- drive the shared search-core loop for the remaining budget ---
+    # Stamp the trials' provenance source as the campaign row through the public
+    # KNIT_SOURCE_ID / KNIT_SOURCE_COMMAND context, so each trial gets a "call"
+    # edge from the optimizations node. Saved and restored around the loop so the
+    # context does not leak into anything this process runs afterwards (e.g. a job
+    # body that drives the loop and then runs more commands).
+    local _saved_src_id="${KNIT_SOURCE_ID:-}" _saved_src_cmd="${KNIT_SOURCE_COMMAND:-}"
+    export KNIT_SOURCE_ID="${campaign}" KNIT_SOURCE_COMMAND="ax optimize"
+    local loop_status=0
     knit_search_loop --mode "${mode}" \
         --ask _knit_ax_ask --collect _knit_ax_collect --observe _knit_ax_observe \
-        --parallel "${parallel}" --budget "${trials}"
+        --parallel "${parallel}" --budget "${remaining}" || loop_status=$?
+    export KNIT_SOURCE_ID="${_saved_src_id}" KNIT_SOURCE_COMMAND="${_saved_src_cmd}"
 
-    # Report the best trial (recorded on the parent row in MB7).
-    local best_resp best_obj
+    # --- resolve the best trial and record the final campaign state ---
+    local best_resp best_obj best_idx best_id="" total_done
     _knit_ax_rpc best_resp '{"cmd":"best"}'
     best_obj=$(knit_jq -r '.best.objective // empty' <<<"${best_resp}")
-    [[ -n "${best_obj}" ]] && knit_info "ax optimize: best objective = %s" "${best_obj}"
+    best_idx=$(knit_jq -r '.best.index // empty' <<<"${best_resp}")
+    total_done=$(knit_jq -r '.n_trials // 0' <<<"${best_resp}")
+    if [[ -n "${best_idx}" && -v _knit_ax_trial_row["${best_idx}"] ]]; then
+        best_id="${_knit_ax_trial_row[${best_idx}]}"
+    fi
+
+    local final_status="completed"
+    (( loop_status != 0 )) && final_status="failed"
+    _knit_ax_finish "${dir}" "${campaign}" "${final_status}" "${total_done}" \
+        "${best_id}" "${best_idx}" "${best_obj}"
+    [[ -n "${best_obj}" ]] \
+        && knit_info "ax optimize: best objective = %s (trial %s)." "${best_obj}" "${best_idx}"
 
     _knit_ax_shutdown
     trap - EXIT
+    return "${loop_status}"
+}
+
+# ------------------------------------------------------------------------------
+# @fn _knit_ax_finish()
+#
+# Record a campaign's final state at the end of an "ax optimize" run, in both
+# places a campaign lives: the on-disk mirror (the status file and result.json,
+# which "ax list"/"ax show" read without a database or an Ax process) and the
+# optimizations DB row (updated by campaign id, the provenance graph node queried
+# by "knit query"). Both are written so a resumed run and a completed run leave a
+# consistent record.
+#
+# @param[in] dir       The campaign directory.
+# @param[in] campaign  The campaign name (the row id).
+# @param[in] status    Final status ("completed" or "failed").
+# @param[in] trials_done Trials recorded in the Ax experiment so far.
+# @param[in] best_id   Row id of the best trial (empty when none).
+# @param[in] best_idx  Ax trial index of the best trial (empty when none).
+# @param[in] best_obj  Objective value of the best trial (empty when none).
+# ------------------------------------------------------------------------------
+_knit_ax_finish() {
+    local dir="$1" campaign="$2" status="$3" trials_done="$4"
+    local best_id="${5:-}" best_idx="${6:-}" best_obj="${7:-}"
+    printf '%s\n' "${status}" > "${dir}/status"
+    knit_jq -n \
+        --argjson trials_done "${trials_done:-0}" \
+        --argjson bidx "${best_idx:-null}" \
+        --argjson bobj "${best_obj:-null}" \
+        --arg  bid  "${best_id}" \
+        '{trials_done:$trials_done, best:{index:$bidx, objective:$bobj, id:$bid}}' \
+        > "${dir}/result.json"
+    knit_db_update_row "optimizations" "${campaign}" \
+        "status=${status}" "best_id=${best_id}" "best_objective=${best_obj}"
+}
+
+# ------------------------------------------------------------------------------
+# @fn _knit_ax_list()
+#
+# Entry point for "ax list". Prints one line per campaign under campaigns/ — its
+# name, status, trials-done/budget, and current best — read entirely from the
+# campaign directories (no Ax process, no database). With --verbose it also prints
+# each campaign's objective/sense and its stored command line.
+#
+# @param[in] ... All arguments as expanded by the CLI framework.
+# ------------------------------------------------------------------------------
+_knit_ax_list() {
+    local verbose
+    verbose=$(knit_get_parameter "verbose" "$@") || verbose="false"
+
+    local root
+    _knit_ax_campaigns_root root
+    local found="false" dir name status def budget objective sense
+    local done_n best
+    for dir in "${root}"/*/; do
+        [[ -d "${dir}" ]] || continue
+        found="true"
+        name="${dir%/}"; name="${name##*/}"
+        status="unknown"
+        [[ -f "${dir}status" ]] && status="$(<"${dir}status")"
+        def=""; budget=""; objective=""; sense=""
+        if [[ -f "${dir}definition.json" ]]; then
+            def="$(<"${dir}definition.json")"
+            IFS=$'\t' read -r budget objective sense \
+                < <(knit_jq -r '[ ((.trials // "")|tostring), (.objective // ""),
+                                  (.sense // "") ] | @tsv' <<<"${def}")
+        fi
+        _knit_ax_campaign_progress done_n best "${name}"
+        printf '%-24s  %-10s  %s/%s  best=%s\n' \
+            "${name}" "${status}" "${done_n:-0}" "${budget:-?}" "${best:-—}"
+        if [[ "${verbose}" == "true" && -n "${def}" ]]; then
+            local -a ds
+            mapfile -t ds < <(knit_jq -r '.downstream[]' <<<"${def}")
+            printf '    objective: %s (%s)\n' "${objective}" "${sense}"
+            printf '    command:   %s\n' "${ds[*]}"
+        fi
+    done
+    [[ "${found}" == "false" ]] && knit_info "ax list: no campaigns yet."
+    return 0
+}
+
+# ------------------------------------------------------------------------------
+# @fn _knit_ax_show()
+#
+# Entry point for "ax show". Prints one campaign's detail — the stored command,
+# status, objective/sense, trials-done/budget, parallelism, seed, current best,
+# and opt-id — read from its campaign directory (no Ax process, no database).
+#
+# @param[in] ... All arguments as expanded by the CLI framework.
+# ------------------------------------------------------------------------------
+_knit_ax_show() {
+    local campaign
+    campaign=$(knit_get_parameter "campaign" "$@")
+
+    local dir
+    _knit_ax_campaign_dir dir "${campaign}"
+    [[ -d "${dir}" ]] || knit_fatal "ax show: no campaign '%s' (%s)." "${campaign}" "${dir}"
+    local deffile="${dir}/definition.json"
+    [[ -f "${deffile}" ]] || knit_fatal "ax show: campaign '%s' has no definition.json." "${campaign}"
+
+    local def
+    def="$(<"${deffile}")"
+    local status="unknown"
+    [[ -f "${dir}/status" ]] && status="$(<"${dir}/status")"
+    local objective sense trials parallel seed opt_id
+    IFS=$'\t' read -r objective sense trials parallel seed opt_id \
+        < <(knit_jq -r '[ .objective, .sense, (.trials|tostring),
+                          (.parallel|tostring), ((.seed // "")|tostring),
+                          .opt_id ] | @tsv' <<<"${def}")
+    local -a ds
+    mapfile -t ds < <(knit_jq -r '.downstream[]' <<<"${def}")
+    local done_n best
+    _knit_ax_campaign_progress done_n best "${campaign}"
+
+    printf 'campaign:   %s\n' "${campaign}"
+    printf 'status:     %s\n' "${status}"
+    printf 'objective:  %s (%s)\n' "${objective}" "${sense}"
+    printf 'trials:     %s/%s\n' "${done_n:-0}" "${trials}"
+    printf 'parallel:   %s\n' "${parallel}"
+    [[ -n "${seed}" ]] && printf 'seed:       %s\n' "${seed}"
+    printf 'best:       %s\n' "${best:-—}"
+    printf 'opt-id:     %s\n' "${opt_id}"
+    printf 'command:    %s\n' "${ds[*]}"
+    return 0
 }
 
 # ------------------------------------------------------------------------------
@@ -814,13 +1221,19 @@ _knit_ax_ask() {
 # dynamic scope. Always returns 0: a single bad trial never aborts the campaign.
 #
 # @param[in] $1 The trial tag (the Ax trial index).
-# @param[in] $2 The trial's child row id (unused; the objective arrives in $4).
+# @param[in] $2 The trial's child row id (stashed so the campaign can resolve
+#   best_id after the loop; the objective itself arrives in $4).
 # @param[in] $3 The trial's terminal status ("completed" or "failed").
 # @param[in] $4 The objective value (empty on a failed/NULL trial).
 # @return 0 always (continue the campaign).
 # ------------------------------------------------------------------------------
 _knit_ax_observe() {
-    local tag="$1" status="$3" objective="$4"
+    local tag="$1" uuid="$2" status="$3" objective="$4"
+    # Map this trial's Ax index to its recorded child row id, so _knit_ax_optimize
+    # can record best_id once Ax names the best trial by index. _knit_ax_trial_row
+    # comes from the enclosing _knit_ax_optimize frame through dynamic scope.
+    # shellcheck disable=SC2154
+    [[ -n "${uuid}" ]] && _knit_ax_trial_row["${tag}"]="${uuid}"
     local req
     # on_failure / penalty come from the enclosing _knit_ax_optimize frame.
     # shellcheck disable=SC2154
