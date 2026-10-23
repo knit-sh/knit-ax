@@ -424,3 +424,144 @@ _knit_ax_build_spec_json() {
           parameters:$params}
          | with_entries(select(.value != null))'
 }
+
+# ------------------------------------------------------------------------------
+# @fn _knit_ax_resolve_objective()
+#
+# Resolve which table and column hold the campaign objective, given the
+# downstream command line and the --objective spec ("[segment:]<output>"). A
+# trial is a chain of segments split on "--" — for Ax, the dispatcher
+# (submit/run) and the target (job/app). The objective rarely lives in the
+# dispatcher's own table (jobs/runs); it is usually a declared output of the
+# target. The resolution follows the design's Objective rules:
+#
+#   - Default: walk the chain leaf-first (target, then dispatcher) and pick the
+#     first segment that declares a knit_with_output of the requested name.
+#   - Override: a "segment:" prefix forces the segment whose command display name
+#     or table name matches, skipping the walk; the output must be declared there.
+#
+# Output names and DB columns fold hyphens to underscores, so the resolved column
+# is the normalized output name. Fatals when the objective is absent or no
+# segment declares it.
+#
+# @param[out] __knit_ret1 The table that holds the objective.
+# @param[out] __knit_ret2 The objective column (normalized output name).
+# @param[in] spec The --objective value ("[segment:]<output>").
+# @param[in] ... The downstream tokens (after the outer "--").
+# ------------------------------------------------------------------------------
+_knit_ax_resolve_objective() {
+    local -n __knit_ret1=$1
+    local -n __knit_ret2=$2
+    local spec="$3"
+    shift 3
+    local -a downstream=("$@")
+    __knit_ret1=""
+    __knit_ret2=""
+
+    if [[ -z "${spec}" ]]; then
+        knit_fatal "ax optimize: no objective given; pass --objective [table:]<output>."
+    fi
+
+    # Split "[segment:]output". Output names never contain ":".
+    local seg="" out="${spec}"
+    if [[ "${spec}" == *:* ]]; then
+        seg="${spec%%:*}"
+        out="${spec#*:}"
+    fi
+    local out_norm="${out//-/_}"
+    local seg_norm="${seg//-/_}"
+
+    local mangled dispatcher target
+    knit_search_resolve_target mangled dispatcher target "${downstream[@]}"
+    if [[ -z "${mangled}" ]]; then
+        knit_fatal "ax optimize: cannot resolve the objective's command from the downstream (no target after --)."
+    fi
+
+    local target_table dispatcher_table
+    knit_command_table target_table "${mangled}"
+    knit_command_table dispatcher_table "${dispatcher}"
+
+    # Chain segments, leaf (target) first. A bare command has a single segment
+    # (its dispatcher display name equals the target).
+    local -a seg_names=("${target}")
+    local -a seg_tables=("${target_table}")
+    local -a seg_mangled=("${mangled}")
+    if [[ "${dispatcher}" != "${target}" ]]; then
+        seg_names+=("${dispatcher}")
+        seg_tables+=("${dispatcher_table}")
+        seg_mangled+=("${dispatcher}")
+    fi
+
+    local i chosen=-1 o
+    local -a outs
+    if [[ -n "${seg}" ]]; then
+        # Explicit segment: match by command display name or by table name.
+        for ((i=0; i<${#seg_names[@]}; i++)); do
+            if [[ "${seg_names[i]//-/_}" == "${seg_norm}" \
+                  || "${seg_tables[i]}" == "${seg}" ]]; then
+                chosen="${i}"; break
+            fi
+        done
+        if [[ "${chosen}" -lt 0 ]]; then
+            knit_fatal "ax optimize: --objective names segment '%s', which is not in the downstream chain." \
+                "${seg}"
+        fi
+        knit_command_outputs outs "${seg_mangled[chosen]}"
+        local found="false"
+        for o in "${outs[@]}"; do
+            [[ "${o}" == "${out_norm}" ]] && found="true" && break
+        done
+        if [[ "${found}" != "true" ]]; then
+            knit_fatal "ax optimize: segment '%s' declares no output '%s'." \
+                "${seg}" "${out}"
+        fi
+    else
+        # Default: leaf-first; the first segment that declares the output wins.
+        for ((i=0; i<${#seg_names[@]}; i++)); do
+            knit_command_outputs outs "${seg_mangled[i]}"
+            for o in "${outs[@]}"; do
+                [[ "${o}" == "${out_norm}" ]] && { chosen="${i}"; break; }
+            done
+            [[ "${chosen}" -ge 0 ]] && break
+        done
+        if [[ "${chosen}" -lt 0 ]]; then
+            knit_fatal "ax optimize: no segment in the downstream declares an output '%s'." \
+                "${out}"
+        fi
+    fi
+
+    __knit_ret1="${seg_tables[chosen]}"
+    __knit_ret2="${out_norm}"
+}
+
+# ------------------------------------------------------------------------------
+# @fn _knit_ax_collect()
+#
+# The campaign's collector callback for knit_search_loop (the --collect hook):
+# read one finished trial's objective by its recorded child row id. The loop runs
+# it the moment a trial reaches a terminal state, before observe. The objective's
+# table and column are resolved once by _knit_ax_optimize and read here through
+# dynamic scope (_knit_ax_obj_table / _knit_ax_obj_column), matching the
+# search-core proposer state contract (the sweep reads its policy the same way).
+# A missing row or NULL/empty objective (a crashed trial) returns non-zero with an
+# empty output, so _knit_ax_observe applies the --on-failure policy.
+#
+# @param[out] $1 The objective value (empty on failure).
+# @param[in] $2 The trial's recorded child row id (from knit_search_launch).
+# @return 0 when a non-empty objective was read, 1 otherwise.
+# ------------------------------------------------------------------------------
+_knit_ax_collect() {
+    local -n __knit_ret=$1
+    local child_id="$2"
+    __knit_ret=""
+    # _knit_ax_obj_table / _knit_ax_obj_column come from the enclosing
+    # _knit_ax_optimize frame through dynamic scope.
+    # shellcheck disable=SC2154
+    local tbl="${_knit_ax_obj_table}" col="${_knit_ax_obj_column}"
+    local val
+    if knit_search_read_objective val "${child_id}" "${tbl}" "${col}"; then
+        __knit_ret="${val}"
+        return 0
+    fi
+    return 1
+}
