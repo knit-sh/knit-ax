@@ -17,6 +17,11 @@
 #
 # The plugin uses only knit's public API (knit_* functions).
 
+# Absolute path to this plugin's own directory, captured at source time so the
+# Ax driver script (ax_driver.py) can be located when the coprocess starts,
+# regardless of the experiment's working directory.
+_KNIT_AX_PLUGIN_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
 knit_import uv
 
 # ------------------------------------------------------------------------------
@@ -132,9 +137,12 @@ _knit_ax_discover() {
 # ------------------------------------------------------------------------------
 # @fn _knit_ax_optimize()
 #
-# Entry point for "ax optimize". Splits the downstream command off the first
-# "--" and fatals when no downstream is given. The Ax optimization loop will be
-# wired in later milestones.
+# Entry point for "ax optimize". Resolves the objective and the search space,
+# starts the Ax driver as a coprocess (with its venv activation confined to the
+# coprocess subshell), and drives the shared search-core loop: each trial is
+# proposed by Ax (ask), launched by the loop, read back (collect), and reported
+# to Ax (observe). The downstream dispatcher picks the loop mode — "submit" /
+# "prepare" run in job mode, "run" in app mode.
 #
 # @param[in] ... All arguments as expanded by the CLI framework.
 # ------------------------------------------------------------------------------
@@ -148,7 +156,99 @@ _knit_ax_optimize() {
         knit_fatal \
             "ax optimize: a downstream command is required after -- (e.g. \"-- submit -- <job> [OPTS]\")."
     fi
-    # Optimization loop wired in MB6.
+
+    # --- options ---
+    local objective maximize_flag seed sobol trials parallel group
+    objective=$(knit_get_parameter "objective" "${args[@]}")     || objective=""
+    maximize_flag=$(knit_get_parameter "maximize" "${args[@]}")  || maximize_flag="false"
+    seed=$(knit_get_parameter "seed" "${args[@]}")               || seed=""
+    sobol=$(knit_get_parameter "sobol-trials" "${args[@]}")      || sobol=""
+    trials=$(knit_get_parameter "trials" "${args[@]}")           || trials=""
+    parallel=$(knit_get_parameter "parallel" "${args[@]}")       || parallel="1"
+    # group/on_failure/penalty are read by the ask/observe callbacks via dynamic
+    # scope (the search-core proposer state contract).
+    # shellcheck disable=SC2034
+    group=$(knit_get_parameter "group" "${args[@]}")             || group=""
+    # shellcheck disable=SC2034
+    local on_failure penalty
+    # shellcheck disable=SC2034
+    on_failure=$(knit_get_parameter "on-failure" "${args[@]}")   || on_failure="ignore"
+    # shellcheck disable=SC2034
+    penalty=$(knit_get_parameter "penalty" "${args[@]}")         || penalty=""
+
+    [[ -z "${objective}" ]] && knit_fatal "ax optimize: --objective is required."
+    [[ -z "${trials}" ]] && knit_fatal "ax optimize: --trials is required (the BO trial budget)."
+
+    local minimize="true"
+    [[ "${maximize_flag}" == "true" ]] && minimize="false"
+
+    # --- loop mode from the downstream dispatcher ---
+    local mangled dispatcher target
+    knit_search_resolve_target mangled dispatcher target "${downstream[@]}"
+    local mode
+    case "${dispatcher}" in
+        submit|prepare) mode="job" ;;
+        run)            mode="app" ;;
+        *) knit_fatal "ax optimize: the downstream must be a 'submit' or 'run' line (got '%s')." "${dispatcher}" ;;
+    esac
+    if [[ "${mode}" == "app" ]] && (( parallel > 1 )); then
+        knit_fatal "ax optimize: --parallel > 1 is not supported in app mode (app trials share one allocation); use --parallel 1."
+    fi
+
+    # --- objective table/column (read by _knit_ax_collect via dynamic scope) ---
+    # shellcheck disable=SC2034
+    local _knit_ax_obj_table _knit_ax_obj_column
+    _knit_ax_resolve_objective _knit_ax_obj_table _knit_ax_obj_column \
+        "${objective}" "${downstream[@]}"
+
+    # --- search-space spec (MB4); a bad objective/space fatals in the subshell ---
+    local spec
+    spec=$(_knit_ax_build_spec_json "${objective}" "${minimize}" "${seed}" \
+        "${sobol}" "${downstream[@]}") || exit $?
+
+    # --- scan the downstream into a template + the varying-slot map, read by
+    # _knit_ax_ask/_knit_ax_reconstruct via dynamic scope ---
+    # shellcheck disable=SC2034
+    local -a template axes rawtokens
+    local -A seen_map
+    knit_search_scan template axes rawtokens seen_map "" "${downstream[@]}"
+    local -A slot_by_param=()
+    local ax_i ax_kind ax_slot ax_name
+    # slot_by_param is consumed by _knit_ax_ask through dynamic scope, which the
+    # linter cannot see; suppress the unused-variable warning on the fill loop.
+    # shellcheck disable=SC2034
+    for ((ax_i=0; ax_i<${#axes[@]}; ax_i++)); do
+        read -r ax_kind ax_slot ax_name <<< "${axes[ax_i]}"
+        case "${ax_kind}" in
+            literal|sweep) slot_by_param["${ax_name}"]="${ax_slot}" ;;
+        esac
+    done
+
+    # --- start the Ax coprocess (activation confined to its subshell) ---
+    local driver_prefix
+    _knit_ax_ensure_driver driver_prefix \
+        || knit_fatal "ax optimize: could not build the _ax-driver environment."
+    _knit_ax_start_driver "${driver_prefix}"
+    trap '_knit_ax_shutdown' EXIT
+
+    # init the driver with the search-space spec
+    local init_req resp
+    init_req=$(knit_jq -cn --argjson spec "${spec}" '{cmd:"init",spec:$spec}')
+    _knit_ax_rpc resp "${init_req}"
+
+    # --- drive the shared search-core loop ---
+    knit_search_loop --mode "${mode}" \
+        --ask _knit_ax_ask --collect _knit_ax_collect --observe _knit_ax_observe \
+        --parallel "${parallel}" --budget "${trials}"
+
+    # Report the best trial (recorded on the parent row in MB7).
+    local best_resp best_obj
+    _knit_ax_rpc best_resp '{"cmd":"best"}'
+    best_obj=$(knit_jq -r '.best.objective // empty' <<<"${best_resp}")
+    [[ -n "${best_obj}" ]] && knit_info "ax optimize: best objective = %s" "${best_obj}"
+
+    _knit_ax_shutdown
+    trap - EXIT
 }
 
 # ------------------------------------------------------------------------------
@@ -564,4 +664,177 @@ _knit_ax_collect() {
         return 0
     fi
     return 1
+}
+
+# ------------------------------------------------------------------------------
+# @fn _knit_ax_start_driver()
+#
+# Start the Ax driver (ax_driver.py) as a bash coprocess, activating the
+# _ax-driver venv ONLY inside the coprocess subshell. The optimize process
+# environment stays pristine so the venv never spills into the trials (in-process
+# in app mode, or via the scheduler's environment propagation in job mode). The
+# coprocess read/write file descriptors and its pid are saved in globals for the
+# RPC helper and the shutdown trap.
+#
+# @param[in] driver_prefix The built _ax-driver instance directory (holds
+#   .activate.sh).
+# ------------------------------------------------------------------------------
+_knit_ax_start_driver() {
+    local driver_prefix="$1"
+    local plugin_dir="${_KNIT_AX_PLUGIN_DIR}"
+    # The activation lives only in this subshell; exec replaces it with python so
+    # no activated shell lingers.
+    coproc AX_DRIVER {
+        # shellcheck disable=SC1091
+        source "${driver_prefix}/.activate.sh"
+        exec python "${plugin_dir}/ax_driver.py"
+    }
+    _KNIT_AX_RPC_OUT="${AX_DRIVER[0]}"
+    _KNIT_AX_RPC_IN="${AX_DRIVER[1]}"
+    _KNIT_AX_COPROC_PID="${AX_DRIVER_PID}"
+}
+
+# ------------------------------------------------------------------------------
+# @fn _knit_ax_rpc()
+#
+# Exchange one request/response with the Ax coprocess: write the request JSON as
+# one line to the driver's stdin, read one response line from its stdout. The
+# driver's protocol is strictly one response per request and the loop talks to it
+# serially (ask then, per finished trial, tell), so no interleaving is possible.
+# This is the single seam the unit tests stub to drive the proposer without a
+# real Ax process.
+#
+# @param[out] $1 The response line (JSON).
+# @param[in] $2 The request line (JSON).
+# ------------------------------------------------------------------------------
+_knit_ax_rpc() {
+    local -n __knit_ret=$1
+    local req="$2"
+    printf '%s\n' "${req}" >&"${_KNIT_AX_RPC_IN}"
+    IFS= read -r __knit_ret <&"${_KNIT_AX_RPC_OUT}"
+}
+
+# ------------------------------------------------------------------------------
+# @fn _knit_ax_shutdown()
+#
+# Tell the Ax coprocess to shut down and reap it, so no orphan Python process is
+# left behind. Idempotent and best-effort: safe to call from the EXIT trap and
+# again on the normal path. The driver exits immediately on the shutdown command.
+# ------------------------------------------------------------------------------
+_knit_ax_shutdown() {
+    [[ -z "${_KNIT_AX_COPROC_PID}" ]] && return 0
+    { printf '%s\n' '{"cmd":"shutdown"}' >&"${_KNIT_AX_RPC_IN}"; } 2>/dev/null || true
+    wait "${_KNIT_AX_COPROC_PID}" 2>/dev/null || true
+    _KNIT_AX_COPROC_PID=""
+}
+
+# ------------------------------------------------------------------------------
+# @fn _knit_ax_reconstruct()
+#
+# Build one trial's downstream command line from the scan template and Ax's
+# proposed parameter values. A varying parameter that appeared as a token on the
+# call site (a literal domain or an @sweep marker) has a template slot, so its
+# value replaces that slot in place; a parameter that varies only through its
+# declared domain (BO's --fill sweep default, no token) has no slot and is
+# appended as "--<name> <value>". Parameter names fold hyphens to underscores;
+# knit accepts either spelling on the resulting line.
+#
+# @param[out] $1 The reconstructed argv array.
+# @param[in] $2 The proposed parameters as a JSON object ({"name":value,...}).
+# @param[in] $3 Name of the scan template array.
+# @param[in] $4 Name of the param->slot associative array.
+# ------------------------------------------------------------------------------
+_knit_ax_reconstruct() {
+    # shellcheck disable=SC2178 # nameref output used as an array
+    local -n __knit_ret=$1
+    local params_json="$2"
+    local -n __knit_tmpl=$3
+    local -n __knit_slot=$4
+    __knit_ret=("${__knit_tmpl[@]}")
+    local name value norm
+    while IFS=$'\t' read -r name value; do
+        [[ -z "${name}" ]] && continue
+        norm="${name//-/_}"
+        if [[ -v __knit_slot["${norm}"] ]]; then
+            __knit_ret["${__knit_slot[${norm}]}"]="${value}"
+        else
+            __knit_ret+=("--${norm}" "${value}")
+        fi
+    done < <(knit_jq -r 'to_entries[] | "\(.key)\t\(.value)"' <<<"${params_json}")
+}
+
+# ------------------------------------------------------------------------------
+# @fn _knit_ax_ask()
+#
+# The campaign's ask callback for knit_search_loop (the --ask hook): request the
+# next assignment from the Ax coprocess, reconstruct the downstream line with the
+# proposed values spliced into the varying slots, splice --group in (job mode),
+# and hand back the opaque tag (the Ax trial index) and the argv. The template,
+# the param->slot map, and the group come from the enclosing _knit_ax_optimize
+# frame through dynamic scope. Returns non-zero when Ax proposes no trial.
+#
+# @param[out] $1 The trial tag (the Ax trial index).
+# @param[out] $2 The reconstructed downstream argv.
+# @return 0 when a trial was produced, 1 when none is available.
+# ------------------------------------------------------------------------------
+_knit_ax_ask() {
+    local -n __knit_ret_tag=$1
+    # shellcheck disable=SC2178 # nameref output used as an array
+    local -n __knit_ret_argv=$2
+    local resp
+    _knit_ax_rpc resp '{"cmd":"ask","n":1}'
+    # Internal locals avoid the names a caller is likely to pass as the output
+    # arguments (tag/argv), which would shadow the namerefs above.
+    local trial_tag
+    trial_tag=$(knit_jq -r '.trials[0].index // empty' <<<"${resp}")
+    [[ -z "${trial_tag}" ]] && return 1
+    local params
+    params=$(knit_jq -c '.trials[0].params' <<<"${resp}")
+    local -a trial_argv
+    # template / slot_by_param / group come from the enclosing _knit_ax_optimize
+    # frame through dynamic scope.
+    # shellcheck disable=SC2154
+    _knit_ax_reconstruct trial_argv "${params}" template slot_by_param
+    # shellcheck disable=SC2154
+    knit_search_group_forward trial_argv "${group}"
+    __knit_ret_tag="${trial_tag}"
+    __knit_ret_argv=("${trial_argv[@]}")
+    return 0
+}
+
+# ------------------------------------------------------------------------------
+# @fn _knit_ax_observe()
+#
+# The campaign's observe callback for knit_search_loop (the --observe hook): tell
+# Ax one finished trial's outcome. A completed trial with a read objective is told
+# as "ok"; a failed trial or a NULL/absent objective applies --on-failure —
+# "ignore" tells Ax the trial failed (dropped from the model), "penalize" tells a
+# fixed objective value so the model learns to avoid that region. The --on-failure
+# policy and the penalty come from the enclosing _knit_ax_optimize frame through
+# dynamic scope. Always returns 0: a single bad trial never aborts the campaign.
+#
+# @param[in] $1 The trial tag (the Ax trial index).
+# @param[in] $2 The trial's child row id (unused; the objective arrives in $4).
+# @param[in] $3 The trial's terminal status ("completed" or "failed").
+# @param[in] $4 The objective value (empty on a failed/NULL trial).
+# @return 0 always (continue the campaign).
+# ------------------------------------------------------------------------------
+_knit_ax_observe() {
+    local tag="$1" status="$3" objective="$4"
+    local req
+    # on_failure / penalty come from the enclosing _knit_ax_optimize frame.
+    # shellcheck disable=SC2154
+    if [[ "${status}" == "completed" && -n "${objective}" ]]; then
+        req=$(knit_jq -cn --argjson i "${tag}" --argjson o "${objective}" \
+            '{cmd:"tell",index:$i,objective:$o,status:"ok"}')
+    elif [[ "${on_failure}" == "penalize" && -n "${penalty}" ]]; then
+        req=$(knit_jq -cn --argjson i "${tag}" --argjson o "${penalty}" \
+            '{cmd:"tell",index:$i,objective:$o,status:"penalized"}')
+    else
+        req=$(knit_jq -cn --argjson i "${tag}" \
+            '{cmd:"tell",index:$i,status:"failed"}')
+    fi
+    local resp
+    _knit_ax_rpc resp "${req}"
+    return 0
 }
