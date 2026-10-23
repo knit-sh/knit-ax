@@ -340,6 +340,13 @@ _knit_ax_prepare() {
         || knit_fatal "ax prepare: could not create campaign directory '%s'." "${dir}"
 
     # --- write the portable definition and the status marker ---
+    # Build the downstream argv array from a NUL-delimited stream rather than
+    # jq's --args: --args treats a bare "--" as its own end-of-arguments marker
+    # and silently drops it, which would lose the inner "-- <job>" separator a
+    # "submit -- <job>" / "run -- <app>" line depends on.
+    local downstream_json
+    downstream_json=$(printf '%s\0' "${downstream[@]}" \
+        | knit_jq -Rsc 'split("\u0000")[:-1]')
     knit_jq -n \
         --arg  campaign  "${campaign}" \
         --arg  objective "${objective}" \
@@ -352,11 +359,11 @@ _knit_ax_prepare() {
         --arg  on_failure "${on_failure}" \
         --argjson penalty  "${penalty:-null}" \
         --arg  opt_id    "${campaign}" \
+        --argjson downstream "${downstream_json}" \
         '{campaign:$campaign, objective:$objective, minimize:$minimize,
           sense:$sense, trials:$trials, parallel:$parallel, seed:$seed,
           sobol_trials:$sobol, on_failure:$on_failure, penalty:$penalty,
-          downstream:$ARGS.positional, opt_id:$opt_id}' \
-        --args "${downstream[@]}" > "${dir}/definition.json"
+          downstream:$downstream, opt_id:$opt_id}' > "${dir}/definition.json"
     printf 'prepared\n' > "${dir}/status"
 
     # --- record the optimizations row under the campaign id ---
@@ -413,11 +420,14 @@ _knit_ax_optimize() {
     # on_failure / penalty are read by _knit_ax_observe via dynamic scope.
     # shellcheck disable=SC2034
     local on_failure penalty
-    IFS=$'\t' read -r objective minimize trials parallel seed sobol on_failure penalty \
+    # Join on a non-whitespace delimiter (SOH, ): a whitespace delimiter
+    # such as a tab is collapsed by "read", so an empty seed/sobol field would
+    # shift every later field left (e.g. on_failure landing in seed).
+    IFS=$'\001' read -r objective minimize trials parallel seed sobol on_failure penalty \
         < <(knit_jq -r '[ .objective, (.minimize|tostring), (.trials|tostring),
                           (.parallel|tostring), ((.seed // "")|tostring),
                           ((.sobol_trials // "")|tostring), .on_failure,
-                          ((.penalty // "")|tostring) ] | @tsv' <<<"${def}")
+                          ((.penalty // "")|tostring) ] | join("\u0001")' <<<"${def}")
     local -a downstream
     mapfile -t downstream < <(knit_jq -r '.downstream[]' <<<"${def}")
 

@@ -1,5 +1,9 @@
 # Local knit.sh build used by the test suite (point KNIT_SH at it instead).
 knit.sh
 *.swp
+
+# Runtime experiment state, should a command be run from the repo root.
+.knit/
+campaigns/
 __pycache__/
 *.pyc
