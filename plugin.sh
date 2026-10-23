@@ -132,8 +132,23 @@ knit_register_setup "_ax-driver" _knit_ax_driver_setup \
     "Internal: Ax BO environment (knit-ax private, not user-facing)."
 _knit_is_builtin
 # ax_driver.py targets the AxClient service API (ax-platform>=0.4.0), which
-# has been stable across the 0.4→1.x→2.x lineage.
-knit_with_uv_specs "ax-platform>=0.4.0" "numpy"
+# has been stable across the 0.4→1.x→2.x lineage. A full manifest (rather than
+# the knit_with_uv_specs sugar) is used to set requires-python: every ax-platform
+# that satisfies the floor needs Python >=3.10 (and the current line needs
+# >=3.11), so a host interpreter older than that (e.g. the 3.9 on many login
+# nodes and CI images) cannot resolve the dependency. Pinning requires-python
+# >=3.11 makes uv download a managed interpreter that satisfies it instead of
+# failing against the host Python.
+knit_with_uv_env <<'EOF'
+[project]
+name = "knit-ax-driver"
+version = "1.0.0"
+requires-python = ">=3.11"
+dependencies = [
+    "ax-platform>=0.4.0",
+    "numpy",
+]
+EOF
 knit_done
 
 # ------------------------------------------------------------------------------
@@ -162,6 +177,30 @@ _knit_ax_ensure_driver() {
     fi
     __knit_ret="${driver_dir}"
 }
+
+# ------------------------------------------------------------------------------
+# @fn _knit_ax_build_driver_at_bootstrap()
+#
+# Build the private _ax-driver environment at bootstrap, on the login node where
+# the network is reachable, rather than lazily on the first "ax optimize". In app
+# mode "ax optimize" runs from inside a job body on a compute node, which often
+# has no outbound network; an on-demand build there would fail, so the Ax
+# environment must already exist before the job starts. Building it at bootstrap
+# (a login-node step) guarantees that.
+#
+# Best-effort: a failed build warns rather than failing the whole bootstrap, and
+# _knit_ax_ensure_driver still rebuilds on demand from "ax optimize" as a
+# fallback (for an experiment bootstrapped before it imported ax, say).
+# ------------------------------------------------------------------------------
+_knit_ax_build_driver_at_bootstrap() {
+    local prefix
+    _knit_ax_ensure_driver prefix \
+        || knit_warning "ax: could not pre-build the _ax-driver environment at bootstrap; it will be built on first 'ax optimize'."
+}
+
+# Run the pre-build after every "bootstrap" (the uv binary the driver needs is
+# provisioned by bootstrap itself, so this runs once that is in place).
+knit_command_run_after "bootstrap" _knit_ax_build_driver_at_bootstrap
 
 # Enum type for the optimization sense (minimize / maximize).
 knit_enum "ax_sense" "minimize" "maximize"
