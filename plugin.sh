@@ -511,6 +511,9 @@ _knit_ax_optimize() {
         esac
     done
 
+    knit_trace "ax optimize: downstream = [%s]" "${downstream[*]}"
+    knit_trace "ax optimize: scan template = [%s]" "${template[*]}"
+
     # The campaign name is the trial-job group stamp (read by _knit_ax_ask).
     # shellcheck disable=SC2034
     local group="${campaign}"
@@ -1260,6 +1263,8 @@ _knit_ax_ask() {
     _knit_ax_reconstruct trial_argv "${params}" template slot_by_param
     # shellcheck disable=SC2154
     knit_search_group_forward trial_argv "${group}"
+    knit_trace "ax: trial %s params=%s argv=[%s]" \
+        "${trial_tag}" "${params}" "${trial_argv[*]}"
     __knit_ret_tag="${trial_tag}"
     __knit_ret_argv=("${trial_argv[@]}")
     return 0
