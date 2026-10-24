@@ -390,9 +390,14 @@ _knit_ax_prepare() {
     # jq's --args: --args treats a bare "--" as its own end-of-arguments marker
     # and silently drops it, which would lose the inner "-- <job>" separator a
     # "submit -- <job>" / "run -- <app>" line depends on.
+    # "printf '%s\0'" leaves a trailing NUL after the last token. jq 1.7
+    # splits that into a trailing empty element (so a blind "[:-1]" drops it),
+    # but jq 1.6 (the system jq on many clusters) does NOT, so "[:-1]" there
+    # chops the real last token (e.g. a parameter's "@sweep"). Drop the trailing
+    # element only when it is the empty artifact, so both jq versions agree.
     local downstream_json
     downstream_json=$(printf '%s\0' "${downstream[@]}" \
-        | knit_jq -Rsc 'split("\u0000")[:-1]')
+        | knit_jq -Rsc 'split("\u0000") | if (length > 0 and .[-1] == "") then .[:-1] else . end')
     knit_jq -n \
         --arg  campaign  "${campaign}" \
         --arg  objective "${objective}" \
@@ -510,9 +515,6 @@ _knit_ax_optimize() {
             literal|sweep) slot_by_param["${ax_name}"]="${ax_slot}" ;;
         esac
     done
-
-    knit_trace "ax optimize: downstream = [%s]" "${downstream[*]}"
-    knit_trace "ax optimize: scan template = [%s]" "${template[*]}"
 
     # The campaign name is the trial-job group stamp (read by _knit_ax_ask).
     # shellcheck disable=SC2034
@@ -1263,8 +1265,6 @@ _knit_ax_ask() {
     _knit_ax_reconstruct trial_argv "${params}" template slot_by_param
     # shellcheck disable=SC2154
     knit_search_group_forward trial_argv "${group}"
-    knit_trace "ax: trial %s params=%s argv=[%s]" \
-        "${trial_tag}" "${params}" "${trial_argv[*]}"
     __knit_ret_tag="${trial_tag}"
     __knit_ret_argv=("${trial_argv[@]}")
     return 0
