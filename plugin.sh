@@ -532,17 +532,26 @@ _knit_ax_optimize() {
 
     # --- init a fresh campaign, or resume from its persisted state ---
     local state_path="${dir}/state.json"
-    local resp done_trials
+    local resp done_trials op
     if [[ -f "${state_path}" ]]; then
+        op="resume"
         local resume_req
         resume_req=$(knit_jq -cn --arg p "${state_path}" \
             '{cmd:"resume",path:$p,state_path:$p}')
         _knit_ax_rpc resp "${resume_req}"
     else
+        op="initialize"
         local init_req
         init_req=$(knit_jq -cn --argjson spec "${spec}" --arg sp "${state_path}" \
             '{cmd:"init",spec:$spec,state_path:$sp}')
         _knit_ax_rpc resp "${init_req}"
+    fi
+    # Fail loudly if the driver could not init/resume: a non-ok response has no
+    # usable n_trials, and silently treating it as 0 would re-run the whole
+    # budget on top of a campaign's already-recorded trials.
+    if [[ "$(knit_jq -r '.status // "error"' <<<"${resp}")" != "ok" ]]; then
+        knit_fatal "ax optimize: the Ax driver failed to %s campaign '%s': %s" \
+            "${op}" "${campaign}" "$(knit_jq -r '.error // "unknown error"' <<<"${resp}")"
     fi
     done_trials=$(knit_jq -r '.n_trials // 0' <<<"${resp}")
 

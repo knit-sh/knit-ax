@@ -182,10 +182,14 @@ class AxDriver:
         path = req["path"]
         self._state_path = req.get("state_path", path)
         self._client = self._AxClient.load_from_json_file(path)
-        # Recover objective name and sense from the persisted experiment.
+        # Recover the objective name and sense from the persisted experiment.
+        # Use AxClient.objective_name (stable public API) for the name:
+        # opt_cfg.objective.metric does not exist in every Ax version (1.x's
+        # Objective exposes metric_names, not metric), so reaching for .metric
+        # raised "'Objective' object has no attribute 'metric'" and broke resume.
+        self._obj_name = self._client.objective_name
         opt_cfg = self._client.experiment.optimization_config
         if opt_cfg is not None:
-            self._obj_name = opt_cfg.objective.metric.name
             self._minimize = bool(opt_cfg.objective.minimize)
         self._rebuild_observations()
         self._send({"status": "ok", "n_trials": self._n_trials()})
