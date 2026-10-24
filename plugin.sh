@@ -131,19 +131,26 @@ _knit_ax_driver_setup() { :; }
 knit_register_setup "_ax-driver" _knit_ax_driver_setup \
     "Internal: Ax BO environment (knit-ax private, not user-facing)."
 _knit_is_builtin
-# ax_driver.py targets the AxClient service API (ax-platform>=0.4.0), which
-# has been stable across the 0.4→1.x→2.x lineage. A full manifest (rather than
-# the knit_with_uv_specs sugar) is used to set requires-python: every ax-platform
-# that satisfies the floor needs Python >=3.10 (and the current line needs
-# >=3.11), so a host interpreter older than that (e.g. the 3.9 on many login
-# nodes and CI images) cannot resolve the dependency. Pinning requires-python
-# >=3.11 makes uv download a managed interpreter that satisfies it instead of
-# failing against the host Python.
+# ax_driver.py targets the AxClient service API (ax-platform>=0.4.0), which has
+# been stable across the 0.4→1.x→2.x lineage. A full manifest (rather than the
+# knit_with_uv_specs sugar) is used to pin requires-python to the 3.12 line.
+#
+# The window is bounded on BOTH sides on purpose. The floor keeps it off Python
+# the dependencies reject (every ax-platform that satisfies the version floor
+# needs >=3.10, the current line needs >=3.11), so a host 3.9 — common on login
+# nodes and CI images — cannot resolve it; pinning here makes uv fetch a managed
+# interpreter instead. The ceiling keeps it off Python too NEW for the native
+# wheels: with only an open floor, uv (which builds on managed interpreters, see
+# knit-uv) picks the newest managed CPython, and PyTorch — pulled in by
+# ax-platform via botorch — publishes no wheels for a just-released Python
+# (e.g. torch has no 3.15 wheel), so the sync fails "no wheel for the current
+# platform". 3.12 is a well-supported PyTorch target with wheels on every
+# platform knit runs on.
 knit_with_uv_env <<'EOF'
 [project]
 name = "knit-ax-driver"
 version = "1.0.0"
-requires-python = ">=3.11"
+requires-python = ">=3.12,<3.13"
 dependencies = [
     "ax-platform>=0.4.0",
     "numpy",
