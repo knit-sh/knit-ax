@@ -658,13 +658,14 @@ _knit_ax_list() {
     local done_n best
     for dir in "${root}"/*/; do
         [[ -d "${dir}" ]] || continue
+        dir="${dir%/}"
         found="true"
-        name="${dir%/}"; name="${name##*/}"
+        name="${dir##*/}"
         status="unknown"
-        [[ -f "${dir}status" ]] && status="$(<"${dir}status")"
+        [[ -f "${dir}/status" ]] && status="$(<"${dir}/status")"
         def=""; budget=""; objective=""; sense=""
-        if [[ -f "${dir}definition.json" ]]; then
-            def="$(<"${dir}definition.json")"
+        if [[ -f "${dir}/definition.json" ]]; then
+            def="$(<"${dir}/definition.json")"
             IFS=$'\t' read -r budget objective sense \
                 < <(knit_jq -r '[ ((.trials // "")|tostring), (.objective // ""),
                                   (.sense // "") ] | @tsv' <<<"${def}")
@@ -762,6 +763,72 @@ _knit_ax_value_type() {
 }
 
 # ------------------------------------------------------------------------------
+# @fn _knit_ax_choice_json()
+#
+# Build a ChoiceParameter JSON object for parameter <name> of value type
+# <vtype> over the given candidate values. Numeric types ("int"/"float") are
+# ordered and their values emitted as JSON numbers; "str" is unordered and its
+# values emitted verbatim.
+#
+# @param[out] 1 The variable receiving the JSON object.
+# @param[in] name The parameter name.
+# @param[in] vtype The Ax value type ("int", "float", or "str").
+# @param[in] ... The candidate values.
+# ------------------------------------------------------------------------------
+_knit_ax_choice_json() {
+    local -n __knit_ret=$1
+    local name="$2" vtype="$3"
+    shift 3
+    local ordered="false"
+    [[ "${vtype}" == "int" || "${vtype}" == "float" ]] && ordered="true"
+    if [[ "${vtype}" == "str" ]]; then
+        # shellcheck disable=SC2016 # $ARGS/$name are jq variables, not shell
+        __knit_ret=$(knit_jq -cn \
+            --arg     name    "${name}" \
+            --argjson ordered "${ordered}" \
+            '{"name":$name,"ax":"choice","value_type":"str",
+              "ordered":$ordered,
+              "values":$ARGS.positional}' \
+            --args "$@")
+    else
+        # shellcheck disable=SC2016 # $ARGS/$name/$vtype are jq variables, not shell
+        __knit_ret=$(knit_jq -cn \
+            --arg     name    "${name}" \
+            --arg     vtype   "${vtype}" \
+            --argjson ordered "${ordered}" \
+            '{"name":$name,"ax":"choice","value_type":$vtype,
+              "ordered":$ordered,
+              "values":[$ARGS.positional[]|tonumber]}' \
+            --args "$@")
+    fi
+}
+
+# ------------------------------------------------------------------------------
+# @fn _knit_ax_glob_values()
+#
+# Expand the shell glob <pattern> into the array variable named by <out>, with
+# nullglob temporarily enabled so a non-matching pattern yields no entries
+# rather than the literal pattern. Fatals when the pattern matches no files.
+#
+# @param[out] 1 The array variable receiving the matched paths.
+# @param[in] pattern The glob pattern to expand.
+# ------------------------------------------------------------------------------
+_knit_ax_glob_values() {
+    # shellcheck disable=SC2178 # nameref output used as an array
+    local -n __knit_ret_vals=$1
+    local pattern="$2"
+    local had_nullglob="off"
+    shopt -q nullglob && had_nullglob="on"
+    shopt -s nullglob
+    # shellcheck disable=SC2206 # intentional glob expansion
+    __knit_ret_vals=( ${pattern} )
+    [[ "${had_nullglob}" == "off" ]] && shopt -u nullglob
+    if [[ ${#__knit_ret_vals[@]} -eq 0 ]]; then
+        knit_fatal "ax optimize: glob '%s' matched no files." "${pattern}"
+    fi
+}
+
+# ------------------------------------------------------------------------------
 # @fn _knit_ax_build_spec_json()
 #
 # Build the Ax search-space JSON spec from the downstream command line. Resolves
@@ -791,17 +858,17 @@ _knit_ax_build_spec_json() {
     fi
 
     # 2. Scan the downstream tokens: template, axes, raw tokens, seen map.
-    # shellcheck disable=SC2034 # tmpl is a required output slot; only axes/rawtokens/seen_map used
-    local -a tmpl axes rawtokens
+    # shellcheck disable=SC2034 # template is a required output slot; only axes/rawtokens/seen_map used
+    local -a template axes rawtokens
     local -A seen_map
-    knit_search_scan tmpl axes rawtokens seen_map "" "${downstream[@]}"
+    knit_search_scan template axes rawtokens seen_map "" "${downstream[@]}"
 
     # Build a name→axis-index map for explicit literal-token axes.
     local -A axis_by_param=()
-    local i axis_kind aname
-    for ((i=0; i<${#axes[@]}; i++)); do
-        read -r axis_kind _ aname <<< "${axes[i]}"
-        [[ "${axis_kind}" == "literal" ]] && axis_by_param["${aname}"]="${i}"
+    local ax_i ax_kind ax_name
+    for ((ax_i=0; ax_i<${#axes[@]}; ax_i++)); do
+        read -r ax_kind _ ax_name <<< "${axes[ax_i]}"
+        [[ "${ax_kind}" == "literal" ]] && axis_by_param["${ax_name}"]="${ax_i}"
     done
 
     # 3. List target parameters and classify each one.
@@ -857,46 +924,14 @@ _knit_ax_build_spec_json() {
                               "bounds":[$lo,$hi],"log_scale":false}')
                         ;;
                     list)
-                        local vtype ordered
+                        local vtype
                         _knit_ax_value_type vtype "${ptype}" "${tok_vals[@]}"
-                        ordered="false"
-                        [[ "${vtype}" == "int" || "${vtype}" == "float" ]] && ordered="true"
-                        if [[ "${vtype}" == "str" ]]; then
-                            pj=$(knit_jq -cn \
-                                --arg  name    "${param}" \
-                                --argjson ordered "${ordered}" \
-                                '{"name":$name,"ax":"choice","value_type":"str",
-                                  "ordered":$ordered,
-                                  "values":$ARGS.positional}' \
-                                --args "${tok_vals[@]}")
-                        else
-                            pj=$(knit_jq -cn \
-                                --arg  name    "${param}" \
-                                --arg  vtype   "${vtype}" \
-                                --argjson ordered "${ordered}" \
-                                '{"name":$name,"ax":"choice","value_type":$vtype,
-                                  "ordered":$ordered,
-                                  "values":[$ARGS.positional[]|tonumber]}' \
-                                --args "${tok_vals[@]}")
-                        fi
+                        _knit_ax_choice_json pj "${param}" "${vtype}" "${tok_vals[@]}"
                         ;;
                     glob)
-                        local had_nullglob="off"
-                        shopt -q nullglob && had_nullglob="on"
-                        shopt -s nullglob
-                        # shellcheck disable=SC2206 # intentional glob expansion
-                        local -a gvals=( ${tok_desc[glob]} )
-                        [[ "${had_nullglob}" == "off" ]] && shopt -u nullglob
-                        if [[ ${#gvals[@]} -eq 0 ]]; then
-                            knit_fatal "ax optimize: glob '%s' matched no files." \
-                                "${tok_desc[glob]}"
-                        fi
-                        pj=$(knit_jq -cn \
-                            --arg name "${param}" \
-                            '{"name":$name,"ax":"choice","value_type":"str",
-                              "ordered":false,
-                              "values":$ARGS.positional}' \
-                            --args "${gvals[@]}")
+                        local -a gvals
+                        _knit_ax_glob_values gvals "${tok_desc[glob]}"
+                        _knit_ax_choice_json pj "${param}" "str" "${gvals[@]}"
                         ;;
                 esac
                 ax_params_json+=("${pj}")
@@ -904,11 +939,12 @@ _knit_ax_build_spec_json() {
 
             sweep)
                 # Use the declared domain from knit_parameter_space.
-                local vtype ordered
+                local vtype
                 _knit_ax_value_type vtype "${dt}" "${dvals[@]}"
                 local pj
                 case "${dk}" in
                     range)
+                        # shellcheck disable=SC2016 # $name/$vtype/$lo/$hi/$log are jq variables, not shell
                         pj=$(knit_jq -cn \
                             --arg  name  "${param}" \
                             --arg  vtype "${vtype}" \
@@ -919,44 +955,12 @@ _knit_ax_build_spec_json() {
                               "bounds":[$lo,$hi],"log_scale":$log}')
                         ;;
                     list)
-                        ordered="false"
-                        [[ "${vtype}" == "int" || "${vtype}" == "float" ]] && ordered="true"
-                        if [[ "${vtype}" == "str" ]]; then
-                            pj=$(knit_jq -cn \
-                                --arg  name    "${param}" \
-                                --argjson ordered "${ordered}" \
-                                '{"name":$name,"ax":"choice","value_type":"str",
-                                  "ordered":$ordered,
-                                  "values":$ARGS.positional}' \
-                                --args "${dvals[@]}")
-                        else
-                            pj=$(knit_jq -cn \
-                                --arg  name    "${param}" \
-                                --arg  vtype   "${vtype}" \
-                                --argjson ordered "${ordered}" \
-                                '{"name":$name,"ax":"choice","value_type":$vtype,
-                                  "ordered":$ordered,
-                                  "values":[$ARGS.positional[]|tonumber]}' \
-                                --args "${dvals[@]}")
-                        fi
+                        _knit_ax_choice_json pj "${param}" "${vtype}" "${dvals[@]}"
                         ;;
                     glob)
-                        local had_nullglob="off"
-                        shopt -q nullglob && had_nullglob="on"
-                        shopt -s nullglob
-                        # shellcheck disable=SC2206 # intentional glob expansion
-                        local -a gvals=( ${dglob} )
-                        [[ "${had_nullglob}" == "off" ]] && shopt -u nullglob
-                        if [[ ${#gvals[@]} -eq 0 ]]; then
-                            knit_fatal "ax optimize: glob '%s' matched no files." \
-                                "${dglob}"
-                        fi
-                        pj=$(knit_jq -cn \
-                            --arg name "${param}" \
-                            '{"name":$name,"ax":"choice","value_type":"str",
-                              "ordered":false,
-                              "values":$ARGS.positional}' \
-                            --args "${gvals[@]}")
+                        local -a gvals
+                        _knit_ax_glob_values gvals "${dglob}"
+                        _knit_ax_choice_json pj "${param}" "str" "${gvals[@]}"
                         ;;
                 esac
                 ax_params_json+=("${pj}")
