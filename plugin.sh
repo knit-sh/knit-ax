@@ -11,9 +11,13 @@
 #     knit_import ax               # github.com/knit-sh/knit-ax
 #
 # knit-ax depends on knit-uv (Python environment management) and requires a
-# knit build that includes the Phase-A public search-core API (knit_search_loop,
-# knit_search_launch, knit_search_scan, knit_search_resolve_fill,
-# knit_search_group_forward, knit_command_outputs, knit_command_table).
+# knit build that includes the Phase-A public search-core API. The search-core
+# symbols it relies on include knit_search_loop, knit_search_launch,
+# knit_search_scan, knit_search_parse_token, knit_search_resolve_fill,
+# knit_search_resolve_target, knit_search_read_objective,
+# knit_search_group_forward, knit_parameter_space, knit_parameter_type,
+# knit_command_parameters, knit_command_outputs, knit_command_table,
+# knit_command_run_after and knit_output_type.
 #
 # The plugin uses only knit's public API (knit_* functions).
 
@@ -403,6 +407,7 @@ _knit_ax_prepare() {
     local downstream_json
     downstream_json=$(printf '%s\0' "${downstream[@]}" \
         | knit_jq -Rsc 'split("\u0000") | if (length > 0 and .[-1] == "") then .[:-1] else . end')
+    # shellcheck disable=SC2016 # $-names in the filter are jq variables, not shell
     knit_jq -n \
         --arg  campaign  "${campaign}" \
         --arg  objective "${objective}" \
@@ -546,12 +551,14 @@ _knit_ax_optimize() {
     if [[ -f "${state_path}" ]]; then
         op="resume"
         local resume_req
+        # shellcheck disable=SC2016 # $-names in the filter are jq variables, not shell
         resume_req=$(knit_jq -cn --arg p "${state_path}" \
             '{cmd:"resume",path:$p,state_path:$p}')
         _knit_ax_rpc resp "${resume_req}"
     else
         op="initialize"
         local init_req
+        # shellcheck disable=SC2016 # $-names in the filter are jq variables, not shell
         init_req=$(knit_jq -cn --argjson spec "${spec}" --arg sp "${state_path}" \
             '{cmd:"init",spec:$spec,state_path:$sp}')
         _knit_ax_rpc resp "${init_req}"
@@ -637,6 +644,7 @@ _knit_ax_finish() {
     local dir="$1" campaign="$2" status="$3" trials_done="$4"
     local best_id="${5:-}" best_idx="${6:-}" best_obj="${7:-}"
     printf '%s\n' "${status}" > "${dir}/status"
+    # shellcheck disable=SC2016 # $-names in the filter are jq variables, not shell
     knit_jq -n \
         --argjson trials_done "${trials_done:-0}" \
         --argjson bidx "${best_idx:-null}" \
@@ -925,6 +933,7 @@ _knit_ax_build_spec_json() {
                         # For [lo..hi] without a type hint, infer from the bounds.
                         _knit_ax_value_type vtype "${ptype}" \
                             "${tok_desc[lo]}" "${tok_desc[hi]}"
+                        # shellcheck disable=SC2016 # $-names in the filter are jq variables, not shell
                         pj=$(knit_jq -cn \
                             --arg  name  "${param}" \
                             --arg  vtype "${vtype}" \
@@ -1004,6 +1013,7 @@ _knit_ax_build_spec_json() {
     local params_arr
     params_arr=$(printf '%s\n' "${ax_params_json[@]}" | knit_jq -s '.')
 
+    # shellcheck disable=SC2016 # $-names in the filter are jq variables, not shell
     knit_jq -cn \
         --arg  obj_name  "${obj_name}" \
         --argjson minimize "${minimize}" \
@@ -1322,12 +1332,15 @@ _knit_ax_observe() {
     # on_failure / penalty come from the enclosing _knit_ax_optimize frame.
     # shellcheck disable=SC2154
     if [[ "${status}" == "completed" && -n "${objective}" ]]; then
+        # shellcheck disable=SC2016 # $-names in the filter are jq variables, not shell
         req=$(knit_jq -cn --argjson i "${tag}" --argjson o "${objective}" \
             '{cmd:"tell",index:$i,objective:$o,status:"ok"}')
     elif [[ "${on_failure}" == "penalize" && -n "${penalty}" ]]; then
+        # shellcheck disable=SC2016 # $-names in the filter are jq variables, not shell
         req=$(knit_jq -cn --argjson i "${tag}" --argjson o "${penalty}" \
             '{cmd:"tell",index:$i,objective:$o,status:"penalized"}')
     else
+        # shellcheck disable=SC2016 # $-names in the filter are jq variables, not shell
         req=$(knit_jq -cn --argjson i "${tag}" \
             '{cmd:"tell",index:$i,status:"failed"}')
     fi

@@ -11,10 +11,14 @@ trial and the final optimum in the Knit database for full reproducibility.
 
 - A `knit.sh` build that includes the **Phase-A public search-core API**
   (minimum commit `9eae5f8` on the `mdorier/knit-ax-core` branch, or any build
-  from that point forward once merged to `main`). The required public symbols
-  are: `knit_search_loop`, `knit_search_launch`, `knit_search_scan`,
-  `knit_search_resolve_fill`, `knit_search_group_forward`,
-  `knit_command_outputs`, `knit_command_table`.
+  from that point forward once merged to `main`). The search-core symbols the
+  plugin relies on include `knit_search_loop`, `knit_search_launch`,
+  `knit_search_scan`, `knit_search_parse_token`, `knit_search_resolve_fill`,
+  `knit_search_resolve_target`, `knit_search_read_objective`,
+  `knit_search_group_forward`, `knit_parameter_space`, `knit_parameter_type`,
+  `knit_command_parameters`, `knit_command_outputs`, `knit_command_table`,
+  `knit_command_run_after` and `knit_output_type`; the rest of what it uses is
+  the general public `knit_*` API (registration, logging, provenance, database).
 - The [knit-uv](https://github.com/knit-sh/knit-uv) plugin (imported
   automatically; manages the Ax Python environment).
 
@@ -58,6 +62,15 @@ knit ax show --campaign lr-sweep              # progress and current optimum
 the campaign's `optimizations` row. `--sobol-trials` sets how many quasi-random
 trials explore before the model engages, and `--on-failure penalize` tells the
 model a fixed penalty for a failed trial instead of dropping it.
+
+**Range types are inferred from the bounds.** When the swept parameter declares
+no explicit type, an integer-bounded range domain — `--domain '[0..12]'` —
+becomes an **integer** range, so Ax proposes only whole numbers;
+`--domain '[0.0..1.0]'` becomes a continuous (float) range. To get a continuous
+range over integer-looking bounds, declare the parameter's type explicitly as
+`real` in its registration — `knit_with_optional "lr:real" "0" ... --domain
+'[0..12]'` — which overrides the inference; `integer` and `string` types are
+honored the same way.
 
 ### Optimize app runs inside one allocation
 
