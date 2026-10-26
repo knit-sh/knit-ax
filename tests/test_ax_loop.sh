@@ -169,3 +169,27 @@ _capture_rpc() { _knit_ax_rpc() { local -n __r=$1; _TEST_REQ="$2"; __r='{"status
     [[ "$output" == *"submit"* ]]
     [[ "$output" == *"run"* ]]
 }
+
+@test "prepare rejects --on-failure penalize without --penalty" {
+    run knit ax prepare --campaign c1 --objective val_loss --trials 5 \
+        --on-failure penalize -- submit -- train --lr @sweep
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"penalize"* ]]
+    [[ "$output" == *"penalty"* ]]
+}
+
+@test "prepare rejects --trials 0" {
+    run knit ax prepare --campaign c1 --objective val_loss --trials 0 \
+        -- submit -- train --lr @sweep
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"trials"* ]]
+    [[ "$output" == *"positive"* ]]
+}
+
+@test "prepare rejects --parallel 0" {
+    run knit ax prepare --campaign c1 --objective val_loss --trials 5 --parallel 0 \
+        -- submit -- train --lr @sweep
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"parallel"* ]]
+    [[ "$output" == *"positive"* ]]
+}

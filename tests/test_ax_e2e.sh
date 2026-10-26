@@ -201,6 +201,42 @@ _seed_state() {
     [[ "$output" == *"already at budget"* ]]
 }
 
+# ---------- a campaign where every trial fails records no best ----------
+
+@test "optimize with all trials failing completes with a null best" {
+    knit ax prepare --campaign allfail --objective score --maximize \
+        --trials 3 --parallel 1 -- submit -- train --x @sweep
+
+    # Every trial "runs" but yields no objective (NULL score), so collect fails
+    # and the loop tells Ax a failure for each — the bad trials never abort the
+    # campaign (observe always returns 0).
+    knit_search_launch() {
+        local -n __uuid=$1; shift
+        printf 'x\n' >> "${__e2e_launch_log}"
+        local uuid
+        uuid="trial-$(_launch_count)"
+        __uuid="${uuid}"
+        "${_KNIT_SQLITE_EXE}" "${_KNIT_DATABASE}" \
+            "INSERT INTO jobs  (id, state) VALUES ('${uuid}', 'completed');
+             INSERT INTO train (id, score) VALUES ('${uuid}', NULL);"
+        return 0
+    }
+
+    run knit ax optimize --campaign allfail
+    [ "$status" -eq 0 ]
+
+    # The full budget was attempted and the campaign completed, but with no best.
+    [ "$(cat "${CAMPAIGNS}/allfail/status")" = "completed" ]
+    [ "$(_launch_count)" -eq 3 ]
+    [ "$(jq -r '.best.objective' "${CAMPAIGNS}/allfail/result.json")" = "null" ]
+
+    # "ax list" renders the missing best as an em-dash.
+    run knit ax list
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"allfail"* ]]
+    [[ "$output" == *"best=—"* ]]
+}
+
 # ---------- a driver that cannot resume fails loudly (never re-runs budget) ----
 
 # A driver stand-in that answers every non-shutdown command with an error, used

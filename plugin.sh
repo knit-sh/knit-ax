@@ -354,6 +354,11 @@ _knit_ax_prepare() {
 
     [[ -z "${objective}" ]] && knit_fatal "ax prepare: --objective is required."
     [[ -z "${trials}" ]] && knit_fatal "ax prepare: --trials is required (the BO trial budget)."
+    (( trials > 0 )) || knit_fatal "ax prepare: --trials must be a positive integer (got '%s')." "${trials}"
+    (( parallel > 0 )) || knit_fatal "ax prepare: --parallel must be a positive integer (got '%s')." "${parallel}"
+    if [[ "${on_failure}" == "penalize" && -z "${penalty}" ]]; then
+        knit_fatal "ax prepare: --on-failure penalize requires --penalty <value> (the objective value told to Ax for a failed trial)."
+    fi
 
     local minimize="true"
     [[ "${maximize_flag}" == "true" ]] && minimize="false"
@@ -528,7 +533,12 @@ _knit_ax_optimize() {
     _knit_ax_ensure_driver driver_prefix \
         || knit_fatal "ax optimize: could not build the _ax-driver environment."
     _knit_ax_start_driver "${driver_prefix}"
+    # Reap the coprocess on a normal exit and also on an interrupt or a walltime
+    # kill (SIGINT/SIGTERM), so the graceful shutdown+wait is never skipped. The
+    # signal handler exits (143) so the loop does not resume against a dead
+    # coprocess; the EXIT trap is cleared first to avoid a double shutdown.
     trap '_knit_ax_shutdown' EXIT
+    trap '_knit_ax_shutdown; trap - EXIT; exit 143' INT TERM
 
     # --- init a fresh campaign, or resume from its persisted state ---
     local state_path="${dir}/state.json"
@@ -561,7 +571,7 @@ _knit_ax_optimize() {
             "${campaign}" "${done_trials}" "${trials}"
         _knit_ax_finish "${dir}" "${campaign}" "completed" "${done_trials}"
         _knit_ax_shutdown
-        trap - EXIT
+        trap - EXIT INT TERM
         return 0
     fi
     local remaining=$(( trials - done_trials ))
@@ -601,7 +611,7 @@ _knit_ax_optimize() {
         && knit_info "ax optimize: best objective = %s (trial %s)." "${best_obj}" "${best_idx}"
 
     _knit_ax_shutdown
-    trap - EXIT
+    trap - EXIT INT TERM
     return "${loop_status}"
 }
 

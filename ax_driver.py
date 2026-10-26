@@ -113,16 +113,47 @@ class AxDriver:
         _emit(msg)
 
     def _n_trials(self) -> int:
-        """Total trials in the experiment (asked = completed + pending + failed).
+        """Trials that have consumed budget: the terminal evaluated ones
+        (completed or failed).
 
-        This is the count the knit loop measures its budget against: on resume it
-        is how many trials have already been launched, so the caller runs only the
-        remaining budget.
+        This is the count the knit loop measures its budget against. RUNNING or
+        CANDIDATE trials do NOT count: a campaign killed with trials in flight
+        (possible under --parallel > 1) persists them as RUNNING, and on resume
+        they are abandoned (see _abandon_stale_trials) and must be re-launched.
+        Counting them would silently shrink the delivered budget and lose those
+        evaluations.
         """
         try:
-            return len(self._client.experiment.trials)
+            n = 0
+            for trial in self._client.experiment.trials.values():
+                status = trial.status
+                if status.is_completed or status.is_failed:
+                    n += 1
+            return n
         except Exception:
             return 0
+
+    def _abandon_stale_trials(self) -> int:
+        """Abandon any non-terminal trial (RUNNING/CANDIDATE) left behind by a
+        killed campaign, so a resumed campaign does not treat them as still in
+        flight and Ax re-proposes fresh trials for the remaining budget. Returns
+        the number abandoned. Best-effort: a trial that cannot be transitioned is
+        skipped.
+        """
+        n = 0
+        try:
+            for trial in self._client.experiment.trials.values():
+                status = trial.status
+                if status.is_completed or status.is_failed or status.is_abandoned:
+                    continue
+                try:
+                    trial.mark_abandoned(reason="resumed after interruption")
+                    n += 1
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        return n
 
     def _rebuild_observations(self) -> None:
         """Repopulate _observations from a freshly loaded experiment."""
@@ -192,6 +223,7 @@ class AxDriver:
         if opt_cfg is not None:
             self._minimize = bool(opt_cfg.objective.minimize)
         self._rebuild_observations()
+        self._abandon_stale_trials()
         self._send({"status": "ok", "n_trials": self._n_trials()})
 
     def cmd_ask(self, req: dict) -> None:

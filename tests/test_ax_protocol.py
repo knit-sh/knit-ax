@@ -319,6 +319,45 @@ class TestAxProtocol(unittest.TestCase):
             # Best should be the 0.01 trial, not 4.0.
             self.assertLess(resp["best"]["objective"], 1.0, resp)
 
+    def test_resume_ignores_inflight_trials_in_budget(self) -> None:
+        """A trial asked but not told (in flight when a parallel campaign is
+        killed) is persisted RUNNING. On resume it must NOT count against budget:
+        n_trials reports only the completed/failed trial, and the in-flight one is
+        abandoned so the next ask yields a fresh, distinct index.
+        """
+        state = os.path.join(self.tmpdir, "state_inflight.json")
+        completed_idx = None
+        inflight_idx = None
+
+        # First session: ask two (parallel), complete one, leave one in flight.
+        with DriverProcess() as dp:
+            dp.init(state_path=state)
+            ask = dp.send({"cmd": "ask", "n": 2})
+            self.assertEqual(len(ask["trials"]), 2, ask)
+            t0, t1 = ask["trials"]
+            completed_idx = t0["index"]
+            inflight_idx = t1["index"]
+            dp.send({"cmd": "tell", "index": completed_idx,
+                      "objective": _objective(t0["params"]), "status": "ok"})
+            # t1 is deliberately never told; the auto-save after the tell above
+            # persists it as a RUNNING trial.
+
+        # Second session: resume and check budget accounting.
+        with DriverProcess() as dp:
+            resp = dp.send({"cmd": "resume", "path": state, "state_path": state})
+            self.assertEqual(resp.get("status"), "ok", resp)
+            self.assertEqual(
+                resp.get("n_trials"), 1,
+                f"resume must count only the completed trial, not the in-flight "
+                f"one: {resp}",
+            )
+            ask = dp.send({"cmd": "ask", "n": 1})
+            new_idx = ask["trials"][0]["index"]
+            self.assertNotIn(
+                new_idx, (completed_idx, inflight_idx),
+                "resumed ask must propose a fresh trial, not reuse an index",
+            )
+
     # ---- error handling ----
 
     def test_unknown_command_returns_error(self) -> None:
