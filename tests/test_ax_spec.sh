@@ -36,9 +36,27 @@ setup() {
     knit_with_optional "x:real" "0" "x" --domain '[0..1]'
     knit_with_output   "label:string" "" "predicted label"
     knit_done
+    # A command with a glob domain (config) plus a plain string param (data) that
+    # a glob token is given to explicitly, for the @glob paths.
+    knit_register "globcmd" knit_empty "Command with a glob domain."
+    knit_with_optional "config:string" "default.yaml" "config file" --domain '@glob:*.glomtest'
+    knit_with_optional "data:string"   "d"            "data file"
+    knit_with_output   "val_loss:real" ""             "validation loss"
+    knit_done
+    # A command whose glob domain matches nothing in the fixture directory.
+    knit_register "globnomatch" knit_empty "Command whose glob domain matches nothing."
+    knit_with_optional "config:string" "x" "config file" --domain '@glob:*.nomatch_xyz'
+    knit_with_output   "val_loss:real" "" "validation loss"
+    knit_done
+    # A fixture directory holding the files the glob tests match. Bats runs each
+    # test in its own subshell, so a test may cd here without disturbing others.
+    KNIT_AX_GLOB_DIR="$(mktemp -d)"
+    : > "${KNIT_AX_GLOB_DIR}/alpha.glomtest"
+    : > "${KNIT_AX_GLOB_DIR}/beta.glomtest"
 }
 
 teardown() {
+    rm -rf "${KNIT_AX_GLOB_DIR:-}"
     knit_ax_test_db_teardown
 }
 
@@ -125,6 +143,94 @@ _spec() {
     ordered=$(jq -r '.parameters[] | select(.name=="batch") | .ordered'    <<<"$spec")
     [ "$vtype"   = "int" ]
     [ "$ordered" = "true" ]
+}
+
+# ---------- @glob tokens and @glob: domains expand to str choices ----------
+
+@test "explicit @glob token becomes a categorical str ChoiceParameter over matched files" {
+    cd "${KNIT_AX_GLOB_DIR}"
+    local spec
+    spec=$(_spec "val_loss" "true" "" "" globcmd --data '@glob:*.glomtest')
+    local kind vtype ordered vals
+    kind=$(jq -r    '.parameters[] | select(.name=="data") | .ax'         <<<"$spec")
+    vtype=$(jq -r   '.parameters[] | select(.name=="data") | .value_type' <<<"$spec")
+    ordered=$(jq -r '.parameters[] | select(.name=="data") | .ordered'    <<<"$spec")
+    vals=$(jq -r    '.parameters[] | select(.name=="data") | .values|sort|join(",")' <<<"$spec")
+    [ "$kind"    = "choice" ]
+    [ "$vtype"   = "str" ]
+    [ "$ordered" = "false" ]
+    [ "$vals"    = "alpha.glomtest,beta.glomtest" ]
+}
+
+@test "glob domain with @sweep becomes a categorical str ChoiceParameter over matched files" {
+    cd "${KNIT_AX_GLOB_DIR}"
+    local spec
+    spec=$(_spec "val_loss" "true" "" "" globcmd --config @sweep)
+    local kind vtype ordered vals
+    kind=$(jq -r    '.parameters[] | select(.name=="config") | .ax'         <<<"$spec")
+    vtype=$(jq -r   '.parameters[] | select(.name=="config") | .value_type' <<<"$spec")
+    ordered=$(jq -r '.parameters[] | select(.name=="config") | .ordered'    <<<"$spec")
+    vals=$(jq -r    '.parameters[] | select(.name=="config") | .values|sort|join(",")' <<<"$spec")
+    [ "$kind"    = "choice" ]
+    [ "$vtype"   = "str" ]
+    [ "$ordered" = "false" ]
+    [ "$vals"    = "alpha.glomtest,beta.glomtest" ]
+}
+
+@test "an explicit @glob matching no files is fatal" {
+    cd "${KNIT_AX_GLOB_DIR}"
+    run _spec "val_loss" "true" "" "" globcmd --data '@glob:*.nomatch_xyz'
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"matched no files"* ]]
+}
+
+@test "a glob domain matching no files is fatal" {
+    cd "${KNIT_AX_GLOB_DIR}"
+    run _spec "val_loss" "true" "" "" globnomatch --config @sweep
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"matched no files"* ]]
+}
+
+# ---------- _knit_ax_value_type inference (empty knit type) ----------
+
+@test "value_type infers int for all-integer values when the type is empty" {
+    local vt
+    _knit_ax_value_type vt "" 2 4 8
+    [ "$vt" = "int" ]
+}
+
+@test "value_type infers float for a mix of integer and decimal values" {
+    local vt
+    _knit_ax_value_type vt "" 1 2.5 3
+    [ "$vt" = "float" ]
+}
+
+@test "value_type infers str for non-numeric values" {
+    local vt
+    _knit_ax_value_type vt "" sgd adam
+    [ "$vt" = "str" ]
+}
+
+@test "value_type infers str when one member of a numeric list is non-numeric" {
+    local vt
+    _knit_ax_value_type vt "" 1 2 three
+    [ "$vt" = "str" ]
+}
+
+@test "value_type infers str when there are no values to infer from" {
+    local vt
+    _knit_ax_value_type vt ""
+    [ "$vt" = "str" ]
+}
+
+@test "value_type honors an explicit knit type over value inference" {
+    local vt
+    _knit_ax_value_type vt "string" 1 2 3
+    [ "$vt" = "str" ]
+    _knit_ax_value_type vt "real" 1 2 3
+    [ "$vt" = "float" ]
+    _knit_ax_value_type vt "integer" 1.5 2.5
+    [ "$vt" = "int" ]
 }
 
 # ---------- fixed parameters are not in the spec ----------

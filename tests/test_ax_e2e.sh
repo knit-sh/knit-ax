@@ -200,3 +200,46 @@ _seed_state() {
     [ "$(_launch_count)" -eq 0 ]
     [[ "$output" == *"already at budget"* ]]
 }
+
+# ---------- a driver that cannot resume fails loudly (never re-runs budget) ----
+
+# A driver stand-in that answers every non-shutdown command with an error, used
+# to prove "ax optimize" aborts on a failed resume instead of silently treating
+# the campaign as 0 trials done and re-running the whole budget.
+_install_error_driver() {
+    local errdrv="${KNIT_AX_TEST_DB_DIR}/err_driver.py"
+    cat > "${errdrv}" <<'PY'
+import sys, json
+for line in sys.stdin:
+    line = line.strip()
+    if not line:
+        continue
+    if json.loads(line).get("cmd") == "shutdown":
+        break
+    sys.stdout.write(json.dumps({"error": "simulated resume failure"}) + "\n")
+    sys.stdout.flush()
+PY
+    _knit_ax_start_driver() {
+        coproc AX_DRIVER { exec python3 "${KNIT_AX_TEST_DB_DIR}/err_driver.py"; }
+        _KNIT_AX_RPC_OUT="${AX_DRIVER[0]}"
+        _KNIT_AX_RPC_IN="${AX_DRIVER[1]}"
+        _KNIT_AX_COPROC_PID="${AX_DRIVER_PID}"
+    }
+}
+
+@test "optimize fatals loudly when the driver fails to resume" {
+    knit ax prepare --campaign err --objective score --maximize \
+        --trials 5 --parallel 1 -- submit -- train --x @sweep
+
+    # A state.json exists, so optimize takes the resume path; the driver errors.
+    : > "${CAMPAIGNS}/err/state.json"
+    _install_error_driver
+
+    run knit ax optimize --campaign err
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"failed to resume"* ]]
+    [[ "$output" == *"simulated resume failure"* ]]
+    # Crucially, no trial was launched: the failure did not degrade to a 0-done
+    # full-budget re-run.
+    [ "$(_launch_count)" -eq 0 ]
+}
