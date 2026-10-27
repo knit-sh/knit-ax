@@ -169,9 +169,13 @@ knit_done
 # instance directory does not exist yet. Stores the path to the built
 # instance directory in the caller-named variable.
 #
-# The build runs in a subshell so the venv activation from the uv
-# before-callback stays confined and does not leak into the dispatcher
-# process (which would spill into every trial).
+# When the environment is missing, the build is announced with knit_info and its
+# output is wrapped in a frame (knit_framed_run), so the long uv install does not
+# dump raw output; the frame shows live only at trace level and closes afterward,
+# matching how the rest of knit provisions. knit_framed_run runs the build as the
+# first stage of a pipe, i.e. in a subshell, so the venv activation from the uv
+# before-callback stays confined and does not leak into the dispatcher process
+# (which would spill into every trial).
 #
 # @param[out] __knit_ret  Name of the variable to hold the instance path.
 # @return 0 on success, non-zero on build failure.
@@ -184,7 +188,10 @@ _knit_ax_ensure_driver() {
     # from the prefix to recover the experiment root.
     local driver_dir="${prefix%/.knit}/setups/_ax-driver"
     if [[ ! -d "${driver_dir}" ]]; then
-        ( knit setup --name _ax-driver -- _ax-driver ) || return 1
+        knit_info "ax: installing the Ax driver environment (one-time; this may take a few minutes)..."
+        knit_framed_run "ax: install Ax driver environment" \
+            knit setup --name _ax-driver -- _ax-driver || return 1
+        knit_info "ax: Ax driver environment ready."
     fi
     __knit_ret="${driver_dir}"
 }
