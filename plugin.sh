@@ -544,7 +544,8 @@ _knit_ax_optimize() {
     local driver_prefix
     _knit_ax_ensure_driver driver_prefix \
         || knit_fatal "ax optimize: could not build the _ax-driver environment."
-    _knit_ax_start_driver "${driver_prefix}"
+    local driver_log="${dir}/ax-driver.log"
+    _knit_ax_start_driver "${driver_prefix}" "${driver_log}"
     # Reap the coprocess on a normal exit and also on an interrupt or a walltime
     # kill (SIGINT/SIGTERM), so the graceful shutdown+wait is never skipped. The
     # signal handler exits (143) so the loop does not resume against a dead
@@ -574,8 +575,9 @@ _knit_ax_optimize() {
     # usable n_trials, and silently treating it as 0 would re-run the whole
     # budget on top of a campaign's already-recorded trials.
     if [[ "$(knit_jq -r '.status // "error"' <<<"${resp}")" != "ok" ]]; then
-        knit_fatal "ax optimize: the Ax driver failed to %s campaign '%s': %s" \
-            "${op}" "${campaign}" "$(knit_jq -r '.error // "unknown error"' <<<"${resp}")"
+        knit_fatal "ax optimize: the Ax driver failed to %s campaign '%s': %s (see %s)" \
+            "${op}" "${campaign}" "$(knit_jq -r '.error // "unknown error"' <<<"${resp}")" \
+            "${driver_log}"
     fi
     done_trials=$(knit_jq -r '.n_trials // 0' <<<"${resp}")
 
@@ -1184,18 +1186,27 @@ _knit_ax_collect() {
 # coprocess read/write file descriptors and its pid are saved in globals for the
 # RPC helper and the shutdown trap.
 #
+# The coprocess stdout carries the RPC responses (read by _knit_ax_rpc), so it
+# must stay clean. Its stderr carries the Ax library's own logging (and any
+# Python traceback on a crash), which would otherwise land on the terminal; it is
+# redirected (appended) to <log> so the optimize output stays quiet and the log
+# is there to inspect when the driver fails.
+#
 # @param[in] driver_prefix The built _ax-driver instance directory (holds
 #   .activate.sh).
+# @param[in] log Path the driver's stderr is appended to (per-campaign log file).
 # ------------------------------------------------------------------------------
 _knit_ax_start_driver() {
     local driver_prefix="$1"
+    local log="$2"
     local plugin_dir="${_KNIT_AX_PLUGIN_DIR}"
     # The activation lives only in this subshell; exec replaces it with python so
-    # no activated shell lingers.
+    # no activated shell lingers. stderr -> log keeps the Ax library's logging off
+    # the terminal; stdout stays the RPC pipe.
     coproc AX_DRIVER {
         # shellcheck disable=SC1091
         source "${driver_prefix}/.activate.sh"
-        exec python "${plugin_dir}/ax_driver.py"
+        exec python "${plugin_dir}/ax_driver.py" 2>>"${log}"
     }
     _KNIT_AX_RPC_OUT="${AX_DRIVER[0]}"
     _KNIT_AX_RPC_IN="${AX_DRIVER[1]}"
