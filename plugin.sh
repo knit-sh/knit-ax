@@ -548,10 +548,12 @@ _knit_ax_optimize() {
     _knit_ax_start_driver "${driver_prefix}" "${driver_log}"
     # Reap the coprocess on a normal exit and also on an interrupt or a walltime
     # kill (SIGINT/SIGTERM), so the graceful shutdown+wait is never skipped. The
-    # signal handler exits (143) so the loop does not resume against a dead
-    # coprocess; the EXIT trap is cleared first to avoid a double shutdown.
+    # interrupt handler also stamps the campaign "interrupted" so a kill before
+    # the clean finish leaves an accurate, resumable record (see
+    # _knit_ax_interrupt); it exits (143) so the loop does not resume against a
+    # dead coprocess, and clears the EXIT trap first to avoid a double shutdown.
     trap '_knit_ax_shutdown' EXIT
-    trap '_knit_ax_shutdown; trap - EXIT; exit 143' INT TERM
+    trap '_knit_ax_interrupt' INT TERM
 
     # --- init a fresh campaign, or resume from its persisted state ---
     local state_path="${dir}/state.json"
@@ -592,8 +594,21 @@ _knit_ax_optimize() {
     fi
     local remaining=$(( trials - done_trials ))
 
-    printf 'running\n' > "${dir}/status"
-    knit_db_update_row "optimizations" "${campaign}" "status=running"
+    # Seed the incremental progress record. _knit_ax_observe refreshes result.json
+    # and the DB row after every trial, so "ax show"/"ax list" stay accurate even
+    # if the run is killed before _knit_ax_finish runs. These locals carry the live
+    # count and best-so-far; _knit_ax_observe reads them through dynamic scope.
+    # The best is seeded from the driver so a resumed campaign shows its prior best
+    # at once (best_id is unknown for prior-run trials, so it stays empty until a
+    # new trial of this run beats it).
+    local _knit_ax_done="${done_trials}"
+    local _knit_ax_best_obj="" _knit_ax_best_idx="" _knit_ax_best_id=""
+    local seed_best
+    _knit_ax_rpc seed_best '{"cmd":"best"}'
+    _knit_ax_best_obj=$(knit_jq -r '.best.objective // empty' <<<"${seed_best}")
+    _knit_ax_best_idx=$(knit_jq -r '.best.index // empty' <<<"${seed_best}")
+    _knit_ax_finish "${dir}" "${campaign}" "running" "${_knit_ax_done}" \
+        "${_knit_ax_best_id}" "${_knit_ax_best_idx}" "${_knit_ax_best_obj}"
 
     # --- drive the shared search-core loop for the remaining budget ---
     # Stamp the trials' provenance source as the campaign row through the public
@@ -663,6 +678,49 @@ _knit_ax_finish() {
         > "${dir}/result.json"
     knit_db_update_row "optimizations" "${campaign}" \
         "status=${status}" "best_id=${best_id}" "best_objective=${best_obj}"
+}
+
+# ------------------------------------------------------------------------------
+# @fn _knit_ax_is_better()
+#
+# Decide whether a candidate objective improves on the best seen so far, under
+# the campaign's optimization sense. An empty current best means "anything is
+# better" (the first observed trial). The comparison is numeric (awk), so it is
+# correct for floating-point objectives.
+#
+# @param[in] cand     The candidate objective value.
+# @param[in] best     The best objective value so far (empty when none yet).
+# @param[in] minimize "true" to minimize the objective, "false" to maximize.
+# @return 0 when cand is strictly better than best (or best is empty), 1 otherwise.
+# ------------------------------------------------------------------------------
+_knit_ax_is_better() {
+    local cand="$1" best="$2" minimize="$3"
+    [[ -z "${best}" ]] && return 0
+    awk -v c="${cand}" -v b="${best}" -v m="${minimize}" \
+        'BEGIN { if (m == "true") exit !(c < b); else exit !(c > b) }'
+}
+
+# ------------------------------------------------------------------------------
+# @fn _knit_ax_interrupt()
+#
+# The INT/TERM handler for "ax optimize" (installed in _knit_ax_optimize). A
+# walltime kill or a Ctrl-C stops the loop before the clean finish, so stamp the
+# campaign "interrupted" — a resumable terminal status — keeping the trials_done
+# and best already written by _knit_ax_observe. Only the status is flipped: the
+# driver is NOT queried (an RPC in a signal handler could race a half-done loop
+# exchange), and the count/best in result.json are already current. Then reap the
+# coprocess, clear the EXIT trap (avoid a double shutdown), and exit 143. dir and
+# campaign come from the _knit_ax_optimize frame through dynamic scope.
+# ------------------------------------------------------------------------------
+_knit_ax_interrupt() {
+    # shellcheck disable=SC2154
+    printf 'interrupted\n' > "${dir}/status"
+    # shellcheck disable=SC2154
+    knit_db_update_row "optimizations" "${campaign}" "status=interrupted" \
+        2>/dev/null || true
+    _knit_ax_shutdown
+    trap - EXIT INT TERM
+    exit 143
 }
 
 # ------------------------------------------------------------------------------
@@ -1364,5 +1422,27 @@ _knit_ax_observe() {
     fi
     local resp
     _knit_ax_rpc resp "${req}"
+
+    # Incremental progress: count this trial and refresh the best-so-far, then
+    # rewrite the campaign's result.json / DB row so "ax show" is accurate even
+    # if the run is killed before _knit_ax_finish. _knit_ax_done, _knit_ax_best_*,
+    # dir, campaign, and minimize come from the _knit_ax_optimize frame through
+    # dynamic scope. Best tracks the best OBSERVED objective here; the clean
+    # finish still records Ax's authoritative model-best. The guard makes the
+    # recording a no-op when observe runs outside an optimize frame (a unit test
+    # that calls it in isolation to check only the tell): with no campaign there
+    # is nothing to record.
+    # shellcheck disable=SC2154
+    if [[ -n "${dir:-}" && -n "${campaign:-}" ]]; then
+        _knit_ax_done=$(( _knit_ax_done + 1 ))
+        if [[ "${status}" == "completed" && -n "${objective}" ]] \
+            && _knit_ax_is_better "${objective}" "${_knit_ax_best_obj}" "${minimize}"; then
+            _knit_ax_best_obj="${objective}"
+            _knit_ax_best_idx="${tag}"
+            _knit_ax_best_id="${uuid}"
+        fi
+        _knit_ax_finish "${dir}" "${campaign}" "running" "${_knit_ax_done}" \
+            "${_knit_ax_best_id}" "${_knit_ax_best_idx}" "${_knit_ax_best_obj}"
+    fi
     return 0
 }
