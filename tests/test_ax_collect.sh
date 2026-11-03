@@ -36,14 +36,14 @@ teardown() {
 
 @test "resolve picks the job target's table for a declared output" {
     local tbl col
-    _knit_ax_resolve_objective tbl col "val_loss" submit -- train --lr @sweep
+    _knit_ax_resolve_objective tbl col "val_loss" submit -- train --lr @domain
     [ "$tbl" = "train" ]
     [ "$col" = "val_loss" ]
 }
 
 @test "resolve picks the app target's table in run mode" {
     local tbl col
-    _knit_ax_resolve_objective tbl col "throughput" run --procs 4 -- bench --msg-size @sweep
+    _knit_ax_resolve_objective tbl col "throughput" run --procs 4 -- bench --msg-size @domain
     [ "$tbl" = "bench" ]
     [ "$col" = "throughput" ]
 }
@@ -59,7 +59,7 @@ teardown() {
 
 @test "override table:output forces the named segment" {
     local tbl col
-    _knit_ax_resolve_objective tbl col "train:val_loss" submit -- train --lr @sweep
+    _knit_ax_resolve_objective tbl col "train:val_loss" submit -- train --lr @domain
     [ "$tbl" = "train" ]
     [ "$col" = "val_loss" ]
 }
@@ -67,7 +67,7 @@ teardown() {
 @test "override can name the dispatcher segment by its table" {
     # The jobs table declares a "state" output (submit's placement columns).
     local tbl col
-    _knit_ax_resolve_objective tbl col "jobs:state" submit -- train --lr @sweep
+    _knit_ax_resolve_objective tbl col "jobs:state" submit -- train --lr @domain
     [ "$tbl" = "jobs" ]
     [ "$col" = "state" ]
 }

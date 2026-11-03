@@ -69,11 +69,11 @@ _spec() {
     _knit_ax_build_spec_json "${obj}" "${min}" "${seed}" "${sobol}" "$@"
 }
 
-# ---------- @sweep tokens use the declared domain ----------
+# ---------- @domain tokens use the declared domain ----------
 
-@test "lr @sweep becomes a float RangeParameter with log_scale=true" {
+@test "lr @domain becomes a float RangeParameter with log_scale=true" {
     local spec
-    spec=$(_spec "val_loss" "true" "" "" train --lr @sweep --epochs 20)
+    spec=$(_spec "val_loss" "true" "" "" train --lr @domain --epochs 20)
     local kind vtype log
     kind=$(jq -r '.parameters[] | select(.name=="lr") | .ax'          <<<"$spec")
     vtype=$(jq -r '.parameters[] | select(.name=="lr") | .value_type' <<<"$spec")
@@ -86,9 +86,9 @@ _spec() {
     [ "$(jq '.parameters[] | select(.name=="lr") | .bounds[1] == 1'    <<<"$spec")" = "true" ]
 }
 
-@test "batch @sweep becomes an ordered int ChoiceParameter" {
+@test "batch @domain becomes an ordered int ChoiceParameter" {
     local spec
-    spec=$(_spec "val_loss" "true" "" "" train --batch @sweep --epochs 20)
+    spec=$(_spec "val_loss" "true" "" "" train --batch @domain --epochs 20)
     local kind vtype ordered
     kind=$(jq -r    '.parameters[] | select(.name=="batch") | .ax'       <<<"$spec")
     vtype=$(jq -r   '.parameters[] | select(.name=="batch") | .value_type' <<<"$spec")
@@ -162,10 +162,10 @@ _spec() {
     [ "$vals"    = "alpha.glomtest,beta.glomtest" ]
 }
 
-@test "glob domain with @sweep becomes a categorical str ChoiceParameter over matched files" {
+@test "glob domain with @domain becomes a categorical str ChoiceParameter over matched files" {
     cd "${KNIT_AX_GLOB_DIR}"
     local spec
-    spec=$(_spec "val_loss" "true" "" "" globcmd --config @sweep)
+    spec=$(_spec "val_loss" "true" "" "" globcmd --config @domain)
     local kind vtype ordered vals
     kind=$(jq -r    '.parameters[] | select(.name=="config") | .ax'         <<<"$spec")
     vtype=$(jq -r   '.parameters[] | select(.name=="config") | .value_type' <<<"$spec")
@@ -186,7 +186,7 @@ _spec() {
 
 @test "a glob domain matching no files is fatal" {
     cd "${KNIT_AX_GLOB_DIR}"
-    run _spec "val_loss" "true" "" "" globnomatch --config @sweep
+    run _spec "val_loss" "true" "" "" globnomatch --config @domain
     [ "$status" -ne 0 ]
     [[ "$output" == *"matched no files"* ]]
 }
@@ -237,7 +237,7 @@ _spec() {
 
 @test "fixed --epochs 20 does not appear in parameters" {
     local spec
-    spec=$(_spec "val_loss" "true" "" "" train --lr @sweep --epochs 20)
+    spec=$(_spec "val_loss" "true" "" "" train --lr @domain --epochs 20)
     local cnt
     cnt=$(jq '.parameters | map(select(.name=="epochs")) | length' <<<"$spec")
     [ "$cnt" = "0" ]
@@ -245,9 +245,9 @@ _spec() {
 
 # ---------- BO-specific: real --range is a first-class dimension ----------
 
-@test "fill sweep includes lr even without an explicit @sweep token" {
+@test "fill domain includes lr even without an explicit @domain token" {
     local spec
-    # With --fill sweep (BO default), lr has a declared domain → it varies.
+    # With --fill domain (BO default), lr has a declared domain → it varies.
     spec=$(_spec "val_loss" "true" "" "" train --epochs 20)
     local cnt
     cnt=$(jq '.parameters | map(select(.name=="lr")) | length' <<<"$spec")
@@ -256,7 +256,7 @@ _spec() {
 
 @test "real range domain yields a float RangeParameter (not a fatal)" {
     local spec
-    spec=$(_spec "val_loss" "true" "" "" train --lr @sweep --epochs 20)
+    spec=$(_spec "val_loss" "true" "" "" train --lr @domain --epochs 20)
     local kind vtype
     kind=$(jq -r  '.parameters[] | select(.name=="lr") | .ax'          <<<"$spec")
     vtype=$(jq -r '.parameters[] | select(.name=="lr") | .value_type'  <<<"$spec")
@@ -268,7 +268,7 @@ _spec() {
 
 @test "submit -- train downstream resolves to the job parameters" {
     local spec
-    spec=$(_spec "val_loss" "true" "" "" submit -- train --lr @sweep --epochs 10)
+    spec=$(_spec "val_loss" "true" "" "" submit -- train --lr @domain --epochs 10)
     local cnt
     cnt=$(jq '.parameters | length' <<<"$spec")
     [ "$cnt" -ge 1 ]
@@ -281,7 +281,7 @@ _spec() {
 
 @test "objective name and minimize are in the spec" {
     local spec
-    spec=$(_spec "val_loss" "true" "42" "4" train --lr @sweep --epochs 20)
+    spec=$(_spec "val_loss" "true" "42" "4" train --lr @domain --epochs 20)
     local obj_name minimize
     obj_name=$(jq -r  '.objective.name'     <<<"$spec")
     minimize=$(jq -r  '.objective.minimize' <<<"$spec")
@@ -291,14 +291,14 @@ _spec() {
 
 @test "seed and sobol_trials appear in spec when set" {
     local spec
-    spec=$(_spec "val_loss" "false" "42" "4" train --lr @sweep --epochs 20)
+    spec=$(_spec "val_loss" "false" "42" "4" train --lr @domain --epochs 20)
     [ "$(jq '.seed'         <<<"$spec")" = "42" ]
     [ "$(jq '.sobol_trials' <<<"$spec")" = "4" ]
 }
 
 @test "seed and sobol_trials are absent from spec when empty" {
     local spec
-    spec=$(_spec "val_loss" "true" "" "" train --lr @sweep --epochs 20)
+    spec=$(_spec "val_loss" "true" "" "" train --lr @domain --epochs 20)
     [ "$(jq 'has("seed")'         <<<"$spec")" = "false" ]
     [ "$(jq 'has("sobol_trials")' <<<"$spec")" = "false" ]
 }
@@ -315,7 +315,7 @@ _spec() {
 @test "non-numeric objective type is fatal" {
     # labeler declares "label:string" as its output; using it as the objective
     # must fatal because string is not a numeric type.
-    run _spec "label" "true" "" "" labeler --x @sweep
+    run _spec "label" "true" "" "" labeler --x @domain
     [ "$status" -ne 0 ]
     [[ "$output" == *"string"* ]]
 }

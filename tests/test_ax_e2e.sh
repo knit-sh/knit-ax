@@ -138,7 +138,7 @@ _seed_state() {
 
 @test "optimize runs to budget and records the surrogate optimum" {
     knit ax prepare --campaign e2e --objective score --maximize \
-        --trials 5 --parallel 1 -- submit -- train --x @sweep
+        --trials 5 --parallel 1 -- submit -- train --x @domain
     run knit ax optimize --campaign e2e
     [ "$status" -eq 0 ]
 
@@ -170,7 +170,7 @@ _seed_state() {
 
 @test "optimize resumes a partial campaign and reaches the optimum" {
     knit ax prepare --campaign rez --objective score --maximize \
-        --trials 5 --parallel 1 -- submit -- train --x @sweep
+        --trials 5 --parallel 1 -- submit -- train --x @domain
 
     # Simulate a run interrupted after two trials (x = 0, x = 3).
     _seed_state rez 2
@@ -191,7 +191,7 @@ _seed_state() {
 
 @test "optimize is a no-op once the campaign is already at budget" {
     knit ax prepare --campaign full --objective score --maximize \
-        --trials 3 --parallel 1 -- submit -- train --x @sweep
+        --trials 3 --parallel 1 -- submit -- train --x @domain
 
     # A state already holding the full budget: optimize should launch nothing.
     _seed_state full 3
@@ -205,7 +205,7 @@ _seed_state() {
 
 @test "optimize with all trials failing completes with a null best" {
     knit ax prepare --campaign allfail --objective score --maximize \
-        --trials 3 --parallel 1 -- submit -- train --x @sweep
+        --trials 3 --parallel 1 -- submit -- train --x @domain
 
     # Every trial "runs" but yields no objective (NULL score), so collect fails
     # and the loop tells Ax a failure for each — the bad trials never abort the
@@ -265,7 +265,7 @@ PY
 
 @test "optimize fatals loudly when the driver fails to resume" {
     knit ax prepare --campaign err --objective score --maximize \
-        --trials 5 --parallel 1 -- submit -- train --x @sweep
+        --trials 5 --parallel 1 -- submit -- train --x @domain
 
     # A state.json exists, so optimize takes the resume path; the driver errors.
     : > "${CAMPAIGNS}/err/state.json"

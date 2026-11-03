@@ -417,7 +417,7 @@ _knit_ax_prepare() {
     # "printf '%s\0'" leaves a trailing NUL after the last token. jq 1.7
     # splits that into a trailing empty element (so a blind "[:-1]" drops it),
     # but jq 1.6 (the system jq on many clusters) does NOT, so "[:-1]" there
-    # chops the real last token (e.g. a parameter's "@sweep"). Drop the trailing
+    # chops the real last token (e.g. a parameter's "@domain"). Drop the trailing
     # element only when it is the empty artifact, so both jq versions agree.
     local downstream_json
     downstream_json=$(printf '%s\0' "${downstream[@]}" \
@@ -537,7 +537,7 @@ _knit_ax_optimize() {
     for ((ax_i=0; ax_i<${#axes[@]}; ax_i++)); do
         read -r ax_kind ax_slot ax_name <<< "${axes[ax_i]}"
         case "${ax_kind}" in
-            literal|sweep) slot_by_param["${ax_name}"]="${ax_slot}" ;;
+            literal|domain) slot_by_param["${ax_name}"]="${ax_slot}" ;;
         esac
     done
 
@@ -983,7 +983,7 @@ _knit_ax_build_spec_json() {
             has_domain="true"
         fi
 
-        knit_search_resolve_fill resolved "sweep" "${token}" "${has_domain}"
+        knit_search_resolve_fill resolved "domain" "${token}" "${has_domain}"
 
         case "${resolved}" in
             default) continue ;;
@@ -1031,7 +1031,7 @@ _knit_ax_build_spec_json() {
                 ax_params_json+=("${pj}")
                 ;;
 
-            sweep)
+            domain)
                 # Use the declared domain from knit_parameter_space.
                 local vtype
                 _knit_ax_value_type vtype "${dt}" "${dvals[@]}"
@@ -1064,7 +1064,7 @@ _knit_ax_build_spec_json() {
 
     # 4. Validate: at least one varying parameter.
     if [[ ${#ax_params_json[@]} -eq 0 ]]; then
-        knit_fatal "ax optimize: no parameter varies in the downstream '%s'. Add a search token ({...}, [lo..hi], @sweep) or declare --domain for at least one parameter." \
+        knit_fatal "ax optimize: no parameter varies in the downstream '%s'. Add a search token ({...}, [lo..hi], @domain) or declare --domain for at least one parameter." \
             "${target}"
     fi
 
@@ -1218,7 +1218,7 @@ _knit_ax_resolve_objective() {
 # it the moment a trial reaches a terminal state, before observe. The objective's
 # table and column are resolved once by _knit_ax_optimize and read here through
 # dynamic scope (_knit_ax_obj_table / _knit_ax_obj_column), matching the
-# search-core proposer state contract (the sweep reads its policy the same way).
+# search-core proposer state contract (knit sweep reads its policy the same way).
 # A missing row or NULL/empty objective (a crashed trial) returns non-zero with an
 # empty output, so _knit_ax_observe applies the --on-failure policy.
 #
@@ -1318,9 +1318,9 @@ _knit_ax_shutdown() {
 #
 # Build one trial's downstream command line from the scan template and Ax's
 # proposed parameter values. A varying parameter that appeared as a token on the
-# call site (a literal domain or an @sweep marker) has a template slot, so its
+# call site (a literal domain or an @domain marker) has a template slot, so its
 # value replaces that slot in place; a parameter that varies only through its
-# declared domain (BO's --fill sweep default, no token) has no slot and is
+# declared domain (BO's --fill domain default, no token) has no slot and is
 # appended as "--<name> <value>". Parameter names fold hyphens to underscores;
 # knit accepts either spelling on the resulting line.
 #

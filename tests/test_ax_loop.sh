@@ -20,9 +20,9 @@ teardown() {
 
 # ---------- _knit_ax_reconstruct ----------
 
-@test "reconstruct replaces an @sweep slot in place" {
-    local -a template=(submit -- train --lr @sweep --epochs 20)
-    local -A slot_by_param=([lr]=4)   # index of the @sweep token
+@test "reconstruct replaces an @domain slot in place" {
+    local -a template=(submit -- train --lr @domain --epochs 20)
+    local -A slot_by_param=([lr]=4)   # index of the @domain token
     local -a argv
     _knit_ax_reconstruct argv '{"lr":0.03}' template slot_by_param
     [ "${argv[4]}" = "0.03" ]
@@ -34,7 +34,7 @@ teardown() {
 
 @test "reconstruct appends a domain-only varying parameter" {
     local -a template=(submit -- train --epochs 20)
-    local -A slot_by_param=()         # lr has no token (fill sweep)
+    local -A slot_by_param=()         # lr has no token (fill domain)
     local -a argv
     _knit_ax_reconstruct argv '{"lr":0.03}' template slot_by_param
     # original tokens preserved, then "--lr 0.03" appended
@@ -44,7 +44,7 @@ teardown() {
 }
 
 @test "reconstruct handles several parameters (slot + append)" {
-    local -a template=(submit -- train --lr @sweep)
+    local -a template=(submit -- train --lr @domain)
     local -A slot_by_param=([lr]=4)
     local -a argv
     _knit_ax_reconstruct argv '{"lr":0.1,"batch":64}' template slot_by_param
@@ -57,7 +57,7 @@ teardown() {
 # ---------- _knit_ax_ask ----------
 
 @test "ask reconstructs the next trial and returns its index as the tag" {
-    local -a template=(submit -- train --lr @sweep --epochs 20)
+    local -a template=(submit -- train --lr @domain --epochs 20)
     local -A slot_by_param=([lr]=4)
     local group=""
     # Stub the RPC: return one trial.
@@ -70,7 +70,7 @@ teardown() {
 }
 
 @test "ask splices --group in job mode" {
-    local -a template=(submit -- train --lr @sweep)
+    local -a template=(submit -- train --lr @domain)
     local -A slot_by_param=([lr]=4)
     local group="camp1"
     _knit_ax_rpc() { local -n __r=$1; __r='{"trials":[{"index":0,"params":{"lr":0.05}}]}'; }
@@ -144,27 +144,27 @@ _capture_rpc() { _knit_ax_rpc() { local -n __r=$1; _TEST_REQ="$2"; __r='{"status
 # dispatcher onto "ax prepare", which fails fast before any campaign is written.
 
 @test "prepare fatals without --objective" {
-    run knit ax prepare --campaign c1 --trials 5 -- submit -- train --lr @sweep
+    run knit ax prepare --campaign c1 --trials 5 -- submit -- train --lr @domain
     [ "$status" -ne 0 ]
     [[ "$output" == *"objective"* ]]
 }
 
 @test "prepare fatals without --trials" {
-    run knit ax prepare --campaign c1 --objective val_loss -- submit -- train --lr @sweep
+    run knit ax prepare --campaign c1 --objective val_loss -- submit -- train --lr @domain
     [ "$status" -ne 0 ]
     [[ "$output" == *"trials"* ]]
 }
 
 @test "prepare rejects --parallel > 1 in app mode" {
     run knit ax prepare --campaign c1 --objective throughput --trials 5 --parallel 2 \
-        -- run --procs 4 -- bench --msg-size @sweep
+        -- run --procs 4 -- bench --msg-size @domain
     [ "$status" -ne 0 ]
     [[ "$output" == *"parallel"* ]]
     [[ "$output" == *"app mode"* ]]
 }
 
 @test "prepare rejects a non-submit/run downstream" {
-    run knit ax prepare --campaign c1 --objective z --trials 5 -- somebare --x @sweep
+    run knit ax prepare --campaign c1 --objective z --trials 5 -- somebare --x @domain
     [ "$status" -ne 0 ]
     [[ "$output" == *"submit"* ]]
     [[ "$output" == *"run"* ]]
@@ -172,7 +172,7 @@ _capture_rpc() { _knit_ax_rpc() { local -n __r=$1; _TEST_REQ="$2"; __r='{"status
 
 @test "prepare rejects --on-failure penalize without --penalty" {
     run knit ax prepare --campaign c1 --objective val_loss --trials 5 \
-        --on-failure penalize -- submit -- train --lr @sweep
+        --on-failure penalize -- submit -- train --lr @domain
     [ "$status" -ne 0 ]
     [[ "$output" == *"penalize"* ]]
     [[ "$output" == *"penalty"* ]]
@@ -180,7 +180,7 @@ _capture_rpc() { _knit_ax_rpc() { local -n __r=$1; _TEST_REQ="$2"; __r='{"status
 
 @test "prepare rejects --trials 0" {
     run knit ax prepare --campaign c1 --objective val_loss --trials 0 \
-        -- submit -- train --lr @sweep
+        -- submit -- train --lr @domain
     [ "$status" -ne 0 ]
     [[ "$output" == *"trials"* ]]
     [[ "$output" == *"positive"* ]]
@@ -188,7 +188,7 @@ _capture_rpc() { _knit_ax_rpc() { local -n __r=$1; _TEST_REQ="$2"; __r='{"status
 
 @test "prepare rejects --parallel 0" {
     run knit ax prepare --campaign c1 --objective val_loss --trials 5 --parallel 0 \
-        -- submit -- train --lr @sweep
+        -- submit -- train --lr @domain
     [ "$status" -ne 0 ]
     [[ "$output" == *"parallel"* ]]
     [[ "$output" == *"positive"* ]]

@@ -47,13 +47,13 @@ it). Two commands drive it, mirroring `prepare` then `submit drain`:
 ### Optimize a job over its declared space
 
 A trial is a real `knit submit` into the campaign's group. Any parameter that
-declares a search `--domain` becomes a search dimension when you mark it `@sweep`;
+declares a search `--domain` becomes a search dimension when you mark it `@domain`;
 fixed arguments pass through. The objective is a declared output column:
 
 ```bash
 knit ax prepare --campaign lr-sweep --objective val-loss --minimize \
     --trials 50 --parallel 4 --seed 1 \
-    -- submit --setup env -- train --epochs 20 --lr @sweep --batch-size @sweep
+    -- submit --setup env -- train --epochs 20 --lr @domain --batch-size @domain
 knit ax optimize --campaign lr-sweep          # drives the loop; re-run to resume
 knit ax show --campaign lr-sweep              # progress and current optimum
 ```
@@ -81,7 +81,7 @@ objective is read from the app's own table:
 ```bash
 # inside a job that holds the allocation:
 knit ax prepare --campaign bench-tune --objective throughput --maximize \
-    --trials 40 -- run --procs 8 -- bench --msg-size @sweep --algo @sweep
+    --trials 40 -- run --procs 8 -- bench --msg-size @domain --algo @domain
 knit ax optimize --campaign bench-tune
 ```
 

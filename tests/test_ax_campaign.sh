@@ -32,7 +32,7 @@ teardown() {
 
 _prepare_demo() {
     knit ax prepare --campaign demo --objective val_loss --minimize \
-        --trials 8 --parallel 2 --seed 7 -- submit -- train --lr @sweep --epochs 20
+        --trials 8 --parallel 2 --seed 7 -- submit -- train --lr @domain --epochs 20
 }
 
 # ---------- ax prepare ----------
@@ -61,12 +61,12 @@ _prepare_demo() {
     # The downstream argv is stored verbatim as a JSON array.
     [ "$(jq -r '.downstream[0]' <<<"$def")" = "submit" ]
     [ "$(jq -r '.downstream | index("train")' <<<"$def")" != "null" ]
-    [ "$(jq -r '.downstream | index("@sweep")' <<<"$def")" != "null" ]
+    [ "$(jq -r '.downstream | index("@domain")' <<<"$def")" != "null" ]
 }
 
 @test "prepare maximize is reflected in sense" {
     knit ax prepare --campaign up --objective val_loss --maximize --trials 4 \
-        -- submit -- train --lr @sweep
+        -- submit -- train --lr @domain
     [ "$(jq -r '.sense' <<<"$(cat "${CAMPAIGNS}/up/definition.json")")" = "maximize" ]
 }
 
