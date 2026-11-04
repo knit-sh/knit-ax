@@ -38,9 +38,13 @@ it). Two commands drive it, mirroring `prepare` then `submit drain`:
 - `ax prepare --campaign <name> [OPTIONS] -- <downstream>` validates the request,
   resolves the objective, builds the search space, and records the campaign —
   it runs no trial, and fails if the campaign name already exists.
-- `ax optimize --campaign <name>` starts, or resumes, the ask/tell loop toward
-  the budget. First run and every resume are the same call, so a campaign
-  interrupted at walltime continues from its persisted state.
+- `ax optimize --campaign <name> [--trials K] [--max-inflight M]` starts, or
+  resumes, the ask/tell loop toward the budget. First run and every resume are
+  the same call, so a campaign interrupted at walltime continues from its
+  persisted state. `--trials` bounds this call; `--max-inflight` sets its
+  concurrency (per call, default 1).
+- `ax extend --campaign <name> --max-trials <N>` raises a campaign's lifetime
+  budget (never below the trials already run) so `ax optimize` can search further.
 - `ax list` and `ax show --campaign <name>` report progress and the current best
   from the campaign directory (no Ax process, no database).
 
@@ -52,16 +56,21 @@ fixed arguments pass through. The objective is a declared output column:
 
 ```bash
 knit ax prepare --campaign lr-sweep --objective val-loss --minimize \
-    --trials 50 --parallel 4 --seed 1 \
+    --max-trials 50 --seed 1 \
     -- submit --setup env -- train --epochs 20 --lr @domain --batch-size @domain
-knit ax optimize --campaign lr-sweep          # drives the loop; re-run to resume
-knit ax show --campaign lr-sweep              # progress and current optimum
+knit ax optimize --campaign lr-sweep --max-inflight 4   # drive the loop; re-run to resume
+knit ax show --campaign lr-sweep                        # progress and current optimum
 ```
 
-`--parallel` keeps that many trials in flight; each records a `call` edge back to
-the campaign's `optimizations` row. `--sobol-trials` sets how many quasi-random
-trials explore before the model engages, and `--on-failure penalize` tells the
-model a fixed penalty for a failed trial instead of dropping it.
+`--max-trials` is the campaign's lifetime trial budget; `ax optimize` runs up to
+it (or re-run to resume where a previous call stopped). On `ax optimize`,
+`--max-inflight` keeps that many trials in flight (per call, default 1) and
+`--trials K` runs at most K more this call; each trial records a `call` edge back
+to the campaign's `optimizations` row. Raise a reached budget to keep searching
+with `knit ax extend --campaign lr-sweep --max-trials 80`. `--sobol-trials` sets
+how many quasi-random trials explore before the model engages, and
+`--on-failure penalize` tells the model a fixed penalty for a failed trial
+instead of dropping it.
 
 **Range types are inferred from the bounds.** When the swept parameter declares
 no explicit type, an integer-bounded range domain — `--domain '[0..12]'` —
@@ -75,13 +84,13 @@ honored the same way.
 ### Optimize app runs inside one allocation
 
 Swap `-- submit` for `-- run` and give the launch fields. App trials share the
-allocation, so they run **sequentially** (`--parallel` is job-mode only); the
+allocation, so they run **sequentially** (`--max-inflight` is job-mode only); the
 objective is read from the app's own table:
 
 ```bash
 # inside a job that holds the allocation:
 knit ax prepare --campaign bench-tune --objective throughput --maximize \
-    --trials 40 -- run --procs 8 -- bench --msg-size @domain --algo @domain
+    --max-trials 40 -- run --procs 8 -- bench --msg-size @domain --algo @domain
 knit ax optimize --campaign bench-tune
 ```
 

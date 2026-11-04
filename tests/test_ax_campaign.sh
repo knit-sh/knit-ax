@@ -32,7 +32,7 @@ teardown() {
 
 _prepare_demo() {
     knit ax prepare --campaign demo --objective val_loss --minimize \
-        --trials 8 --parallel 2 --seed 7 -- submit -- train --lr @domain --epochs 20
+        --max-trials 8 --seed 7 -- submit -- train --lr @domain --epochs 20
 }
 
 # ---------- ax prepare ----------
@@ -46,7 +46,7 @@ _prepare_demo() {
     [ "$(cat "${CAMPAIGNS}/demo/status")" = "prepared" ]
 }
 
-@test "prepare writes the knobs and the downstream line into definition.json" {
+@test "prepare writes the parameters and the downstream line into definition.json" {
     _prepare_demo
     local def
     def="$(cat "${CAMPAIGNS}/demo/definition.json")"
@@ -54,8 +54,7 @@ _prepare_demo() {
     [ "$(jq -r '.objective'    <<<"$def")" = "val_loss" ]
     [ "$(jq -r '.sense'        <<<"$def")" = "minimize" ]
     [ "$(jq -r '.minimize'     <<<"$def")" = "true" ]
-    [ "$(jq -r '.trials'       <<<"$def")" = "8" ]
-    [ "$(jq -r '.parallel'     <<<"$def")" = "2" ]
+    [ "$(jq -r '.max_trials'   <<<"$def")" = "8" ]
     [ "$(jq -r '.seed'         <<<"$def")" = "7" ]
     [ "$(jq -r '.opt_id'       <<<"$def")" = "demo" ]
     # The downstream argv is stored verbatim as a JSON array.
@@ -65,7 +64,7 @@ _prepare_demo() {
 }
 
 @test "prepare maximize is reflected in sense" {
-    knit ax prepare --campaign up --objective val_loss --maximize --trials 4 \
+    knit ax prepare --campaign up --objective val_loss --maximize --max-trials 4 \
         -- submit -- train --lr @domain
     [ "$(jq -r '.sense' <<<"$(cat "${CAMPAIGNS}/up/definition.json")")" = "maximize" ]
 }
@@ -74,7 +73,7 @@ _prepare_demo() {
     _prepare_demo
     local row
     row=$("${_KNIT_SQLITE_EXE}" "${_KNIT_DATABASE}" \
-        "SELECT campaign||'|'||trials||'|'||status||'|'||sense FROM optimizations WHERE id='demo';")
+        "SELECT campaign||'|'||max_trials||'|'||status||'|'||sense FROM optimizations WHERE id='demo';")
     [ "$row" = "demo|8|prepared|minimize" ]
 }
 
@@ -83,6 +82,34 @@ _prepare_demo() {
     run _prepare_demo
     [ "$status" -ne 0 ]
     [[ "$output" == *"already exists"* ]]
+}
+
+# ---------- ax extend ----------
+
+@test "extend raises the budget in the definition and the optimizations row" {
+    _prepare_demo
+    run knit ax extend --campaign demo --max-trials 20
+    [ "$status" -eq 0 ]
+    [ "$(jq -r '.max_trials' <<<"$(cat "${CAMPAIGNS}/demo/definition.json")")" = "20" ]
+    [ "$("${_KNIT_SQLITE_EXE}" "${_KNIT_DATABASE}" \
+        "SELECT max_trials FROM optimizations WHERE id='demo';")" = "20" ]
+}
+
+@test "extend on a missing campaign fatals" {
+    run knit ax extend --campaign ghost --max-trials 20
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"no campaign"* ]]
+}
+
+@test "extend rejects a budget below the trials already run" {
+    _prepare_demo
+    # Seed progress: 6 trials already recorded for the campaign.
+    printf '{"trials_done":6,"best":{"index":null,"objective":null,"id":""}}\n' \
+        > "${CAMPAIGNS}/demo/result.json"
+    run knit ax extend --campaign demo --max-trials 4
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"below"* ]]
+    [[ "$output" == *"already run"* ]]
 }
 
 # ---------- ax optimize (pre-loop guards) ----------

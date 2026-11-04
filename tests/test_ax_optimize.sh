@@ -38,11 +38,12 @@ teardown() {
     [[ "$output" == *"--objective"* ]]
     [[ "$output" == *"--minimize"* ]]
     [[ "$output" == *"--maximize"* ]]
-    [[ "$output" == *"--trials"* ]]
-    [[ "$output" == *"--parallel"* ]]
+    [[ "$output" == *"--max-trials"* ]]
     [[ "$output" == *"--seed"* ]]
     [[ "$output" == *"--on-failure"* ]]
     [[ "$output" == *"--sobol-trials"* ]]
+    # --parallel is gone; concurrency is a per-call option of ax optimize.
+    [[ "$output" != *"--parallel"* ]]
 }
 
 @test "ax prepare dropped the old --group and --resume options" {
@@ -52,13 +53,22 @@ teardown() {
     [[ "$output" != *"--resume"* ]]
 }
 
-@test "ax optimize --help exits 0 and takes only --campaign" {
+@test "ax optimize --help shows the per-call budget and concurrency options" {
     run knit ax optimize --help
     [ "$status" -eq 0 ]
     [[ "$output" == *"--campaign"* ]]
-    # the OPTIMIZE ARGS live on prepare now, not optimize
+    [[ "$output" == *"--trials"* ]]
+    [[ "$output" == *"--max-inflight"* ]]
+    # strategy options live on prepare, not optimize
     [[ "$output" != *"--objective"* ]]
-    [[ "$output" != *"--trials"* ]]
+    [[ "$output" != *"--sobol-trials"* ]]
+}
+
+@test "ax extend --help shows --campaign and --max-trials" {
+    run knit ax extend --help
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"--campaign"* ]]
+    [[ "$output" == *"--max-trials"* ]]
 }
 
 @test "ax list --help exits 0 and shows --verbose" {
@@ -74,13 +84,13 @@ teardown() {
 }
 
 @test "ax prepare with no downstream fatals" {
-    run knit ax prepare --campaign c1 --objective val_loss --trials 5
+    run knit ax prepare --campaign c1 --objective val_loss --max-trials 5
     [ "$status" -ne 0 ]
     [[ "$output" == *"downstream"* ]]
 }
 
 @test "ax prepare with -- but no command fatals" {
-    run knit ax prepare --campaign c1 --objective val_loss --trials 5 --
+    run knit ax prepare --campaign c1 --objective val_loss --max-trials 5 --
     [ "$status" -ne 0 ]
     [[ "$output" == *"downstream"* ]]
 }

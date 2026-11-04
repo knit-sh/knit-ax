@@ -144,52 +144,69 @@ _capture_rpc() { _knit_ax_rpc() { local -n __r=$1; _TEST_REQ="$2"; __r='{"status
 # dispatcher onto "ax prepare", which fails fast before any campaign is written.
 
 @test "prepare fatals without --objective" {
-    run knit ax prepare --campaign c1 --trials 5 -- submit -- train --lr @domain
+    run knit ax prepare --campaign c1 --max-trials 5 -- submit -- train --lr @domain
     [ "$status" -ne 0 ]
     [[ "$output" == *"objective"* ]]
 }
 
-@test "prepare fatals without --trials" {
+@test "prepare fatals without --max-trials" {
     run knit ax prepare --campaign c1 --objective val_loss -- submit -- train --lr @domain
     [ "$status" -ne 0 ]
-    [[ "$output" == *"trials"* ]]
-}
-
-@test "prepare rejects --parallel > 1 in app mode" {
-    run knit ax prepare --campaign c1 --objective throughput --trials 5 --parallel 2 \
-        -- run --procs 4 -- bench --msg-size @domain
-    [ "$status" -ne 0 ]
-    [[ "$output" == *"parallel"* ]]
-    [[ "$output" == *"app mode"* ]]
+    [[ "$output" == *"max-trials"* ]]
 }
 
 @test "prepare rejects a non-submit/run downstream" {
-    run knit ax prepare --campaign c1 --objective z --trials 5 -- somebare --x @domain
+    run knit ax prepare --campaign c1 --objective z --max-trials 5 -- somebare --x @domain
     [ "$status" -ne 0 ]
     [[ "$output" == *"submit"* ]]
     [[ "$output" == *"run"* ]]
 }
 
 @test "prepare rejects --on-failure penalize without --penalty" {
-    run knit ax prepare --campaign c1 --objective val_loss --trials 5 \
+    run knit ax prepare --campaign c1 --objective val_loss --max-trials 5 \
         --on-failure penalize -- submit -- train --lr @domain
     [ "$status" -ne 0 ]
     [[ "$output" == *"penalize"* ]]
     [[ "$output" == *"penalty"* ]]
 }
 
-@test "prepare rejects --trials 0" {
-    run knit ax prepare --campaign c1 --objective val_loss --trials 0 \
+@test "prepare rejects --max-trials 0" {
+    run knit ax prepare --campaign c1 --objective val_loss --max-trials 0 \
         -- submit -- train --lr @domain
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"max-trials"* ]]
+    [[ "$output" == *"positive"* ]]
+}
+
+# ---------- optimize-time validations ----------
+# Concurrency (--max-inflight) and the per-call --trials batch live on optimize.
+# The positive-integer checks run before the campaign directory is resolved, so
+# they need no prepared campaign.
+
+@test "optimize rejects --max-inflight 0" {
+    run knit ax optimize --campaign c1 --max-inflight 0
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"max-inflight"* ]]
+    [[ "$output" == *"positive"* ]]
+}
+
+@test "optimize rejects --trials 0" {
+    run knit ax optimize --campaign c1 --trials 0
     [ "$status" -ne 0 ]
     [[ "$output" == *"trials"* ]]
     [[ "$output" == *"positive"* ]]
 }
 
-@test "prepare rejects --parallel 0" {
-    run knit ax prepare --campaign c1 --objective val_loss --trials 5 --parallel 0 \
-        -- submit -- train --lr @domain
+@test "optimize rejects --max-inflight > 1 in app mode" {
+    # Seed a minimal app-mode (run) campaign; the mode guard fires before the Ax
+    # coprocess or any objective resolution, so no app need be registered.
+    local dir
+    _knit_ax_campaign_dir dir appmode
+    mkdir -p "${dir}"
+    printf '{"downstream":["run","--procs","4","--","bench","--msg-size","@domain"],"max_trials":5}\n' \
+        > "${dir}/definition.json"
+    run knit ax optimize --campaign appmode --max-inflight 2
     [ "$status" -ne 0 ]
-    [[ "$output" == *"parallel"* ]]
-    [[ "$output" == *"positive"* ]]
+    [[ "$output" == *"max-inflight"* ]]
+    [[ "$output" == *"app mode"* ]]
 }

@@ -24,7 +24,7 @@ setup() {
     knit_with_output   "val_loss:real" "" "validation loss"
     knit_done
     knit ax prepare --campaign demo --objective val_loss --minimize \
-        --trials 8 --parallel 1 --seed 1 -- submit -- train --lr @domain
+        --max-trials 8 --seed 1 -- submit -- train --lr @domain
     DIR="${CAMPAIGNS}/demo"
 }
 

@@ -269,10 +269,8 @@ _knit_ax_discover() {
     # Recorded options (auto-create columns in the optimizations table).
     knit_with_optional "objective:string" "" \
         "Which declared output to optimize; [table:]<output>."
-    knit_with_optional "trials:integer" "" \
-        "Total trial budget."
-    knit_with_optional "parallel:integer" "1" \
-        "Max trials in flight (job mode only; app mode runs sequentially)."
+    knit_with_optional "max-trials:integer" "" \
+        "Lifetime trial budget for the campaign (raise later with 'ax extend')."
     knit_with_optional "seed:integer" "" \
         "Ax RNG seed; recorded for reproducibility."
     # Control-only options (parsed, validated, shown in help, stored in the
@@ -312,6 +310,21 @@ _knit_ax_discover() {
     knit_without_provenance
     knit_with_required "campaign:string" \
         "The campaign to run or resume (its campaigns/<name>/ directory must exist)."
+    knit_with_optional "trials:integer" "" \
+        "Run at most this many more trials this call (default: run to the campaign's --max-trials)."
+    knit_with_optional "max-inflight:integer" "1" \
+        "Max trials in flight for this call (job mode only; app mode runs sequentially). Per-call; not recorded."
+    knit_done
+
+    # --- ax extend: raise a prepared campaign's trial budget -----------------
+    knit_register "ax:extend" _knit_ax_extend \
+        "Raise a prepared campaign's lifetime trial budget (--max-trials)."
+    # Mutates the existing campaign row and definition in place; records no row.
+    knit_without_provenance
+    knit_with_required "campaign:string" \
+        "The campaign whose budget to raise (its campaigns/<name>/ directory must exist)."
+    knit_with_required "max-trials:integer" \
+        "New lifetime trial budget; must be at least the trials already run."
     knit_done
 
     # --- ax list: one line per campaign --------------------------------------
@@ -359,22 +372,20 @@ _knit_ax_prepare() {
     fi
 
     # --- options ---
-    local campaign objective maximize_flag seed sobol trials parallel
+    local campaign objective maximize_flag seed sobol max_trials
     local on_failure penalty
     campaign=$(knit_get_parameter "campaign" "${args[@]}")
     objective=$(knit_get_parameter "objective" "${args[@]}")     || objective=""
     maximize_flag=$(knit_get_parameter "maximize" "${args[@]}")  || maximize_flag="false"
     seed=$(knit_get_parameter "seed" "${args[@]}")               || seed=""
     sobol=$(knit_get_parameter "sobol-trials" "${args[@]}")      || sobol=""
-    trials=$(knit_get_parameter "trials" "${args[@]}")           || trials=""
-    parallel=$(knit_get_parameter "parallel" "${args[@]}")       || parallel="1"
+    max_trials=$(knit_get_parameter "max-trials" "${args[@]}")   || max_trials=""
     on_failure=$(knit_get_parameter "on-failure" "${args[@]}")   || on_failure="ignore"
     penalty=$(knit_get_parameter "penalty" "${args[@]}")         || penalty=""
 
     [[ -z "${objective}" ]] && knit_fatal "ax prepare: --objective is required."
-    [[ -z "${trials}" ]] && knit_fatal "ax prepare: --trials is required (the BO trial budget)."
-    (( trials > 0 )) || knit_fatal "ax prepare: --trials must be a positive integer (got '%s')." "${trials}"
-    (( parallel > 0 )) || knit_fatal "ax prepare: --parallel must be a positive integer (got '%s')." "${parallel}"
+    [[ -z "${max_trials}" ]] && knit_fatal "ax prepare: --max-trials is required (the campaign's lifetime trial budget)."
+    (( max_trials > 0 )) || knit_fatal "ax prepare: --max-trials must be a positive integer (got '%s')." "${max_trials}"
     if [[ "${on_failure}" == "penalize" && -z "${penalty}" ]]; then
         knit_fatal "ax prepare: --on-failure penalize requires --penalty <value> (the objective value told to Ax for a failed trial)."
     fi
@@ -384,12 +395,12 @@ _knit_ax_prepare() {
     local sense="minimize"
     [[ "${minimize}" == "false" ]] && sense="maximize"
 
-    # --- loop mode (for the app-mode --parallel guard; fail fast at prepare) ---
-    local mode
-    _knit_ax_mode_from_downstream mode "${downstream[@]}"
-    if [[ "${mode}" == "app" ]] && (( parallel > 1 )); then
-        knit_fatal "ax prepare: --parallel > 1 is not supported in app mode (app trials share one allocation); use --parallel 1."
-    fi
+    # Validate that the downstream is a submit/run line (fail fast at prepare).
+    # The resolved mode itself is not needed here — concurrency (--max-inflight)
+    # lives on "ax optimize" now — but a bad dispatcher must still be rejected.
+    # shellcheck disable=SC2034 # only the fatal-on-bad-downstream side effect is wanted
+    local _mode
+    _knit_ax_mode_from_downstream _mode "${downstream[@]}"
 
     # --- resolve the objective and build the spec now, so errors surface here ---
     # shellcheck disable=SC2034 # obj_table/obj_column prove the objective resolves
@@ -428,8 +439,7 @@ _knit_ax_prepare() {
         --arg  objective "${objective}" \
         --argjson minimize "${minimize}" \
         --arg  sense     "${sense}" \
-        --argjson trials   "${trials}" \
-        --argjson parallel "${parallel}" \
+        --argjson max_trials "${max_trials}" \
         --argjson seed     "${seed:-null}" \
         --argjson sobol    "${sobol:-null}" \
         --arg  on_failure "${on_failure}" \
@@ -437,7 +447,7 @@ _knit_ax_prepare() {
         --arg  opt_id    "${campaign}" \
         --argjson downstream "${downstream_json}" \
         '{campaign:$campaign, objective:$objective, minimize:$minimize,
-          sense:$sense, trials:$trials, parallel:$parallel, seed:$seed,
+          sense:$sense, max_trials:$max_trials, seed:$seed,
           sobol_trials:$sobol, on_failure:$on_failure, penalty:$penalty,
           downstream:$downstream, opt_id:$opt_id}' > "${dir}/definition.json"
     printf 'prepared\n' > "${dir}/status"
@@ -445,14 +455,14 @@ _knit_ax_prepare() {
     # --- record the optimizations row under the campaign id ---
     # The campaign name is the row id (and the opt-id), so "ax optimize" can
     # re-attach to this row and the trials can call-edge to it. campaign /
-    # objective / trials / parallel / seed are auto-recorded from the options
-    # above; sense and status are set here.
+    # objective / max_trials / seed are auto-recorded from the options above;
+    # sense and status are set here.
     knit_set_row_id "${campaign}"
     knit_output "sense" "${sense}"
     knit_output "status" "prepared"
 
-    knit_info "ax prepare: campaign '%s' prepared (%s trials, objective '%s', %s)." \
-        "${campaign}" "${trials}" "${objective}" "${sense}"
+    knit_info "ax prepare: campaign '%s' prepared (budget %s trials, objective '%s', %s)." \
+        "${campaign}" "${max_trials}" "${objective}" "${sense}"
 }
 
 # ------------------------------------------------------------------------------
@@ -476,8 +486,14 @@ _knit_ax_prepare() {
 # @param[in] ... All arguments as expanded by the CLI framework.
 # ------------------------------------------------------------------------------
 _knit_ax_optimize() {
-    local campaign
+    local campaign per_call_trials max_inflight
     campaign=$(knit_get_parameter "campaign" "$@")
+    per_call_trials=$(knit_get_parameter "trials" "$@")       || per_call_trials=""
+    max_inflight=$(knit_get_parameter "max-inflight" "$@")    || max_inflight="1"
+    (( max_inflight > 0 )) || knit_fatal "ax optimize: --max-inflight must be a positive integer (got '%s')." "${max_inflight}"
+    if [[ -n "${per_call_trials}" ]] && ! (( per_call_trials > 0 )); then
+        knit_fatal "ax optimize: --trials must be a positive integer (got '%s')." "${per_call_trials}"
+    fi
 
     local dir
     _knit_ax_campaign_dir dir "${campaign}"
@@ -492,16 +508,16 @@ _knit_ax_optimize() {
     # --- read back the stored definition ---
     local def
     def="$(<"${deffile}")"
-    local objective minimize trials parallel seed sobol
+    local objective minimize max_trials seed sobol
     # on_failure / penalty are read by _knit_ax_observe via dynamic scope.
     # shellcheck disable=SC2034
     local on_failure penalty
     # Join on a non-whitespace delimiter (SOH, ): a whitespace delimiter
     # such as a tab is collapsed by "read", so an empty seed/sobol field would
     # shift every later field left (e.g. on_failure landing in seed).
-    IFS=$'\001' read -r objective minimize trials parallel seed sobol on_failure penalty \
-        < <(knit_jq -r '[ .objective, (.minimize|tostring), (.trials|tostring),
-                          (.parallel|tostring), ((.seed // "")|tostring),
+    IFS=$'\001' read -r objective minimize max_trials seed sobol on_failure penalty \
+        < <(knit_jq -r '[ .objective, (.minimize|tostring), (.max_trials|tostring),
+                          ((.seed // "")|tostring),
                           ((.sobol_trials // "")|tostring), .on_failure,
                           ((.penalty // "")|tostring) ] | join("\u0001")' <<<"${def}")
     local -a downstream
@@ -510,8 +526,8 @@ _knit_ax_optimize() {
     # --- loop mode ---
     local mode
     _knit_ax_mode_from_downstream mode "${downstream[@]}"
-    if [[ "${mode}" == "app" ]] && (( parallel > 1 )); then
-        knit_fatal "ax optimize: --parallel > 1 is not supported in app mode; re-prepare the campaign with --parallel 1."
+    if [[ "${mode}" == "app" ]] && (( max_inflight > 1 )); then
+        knit_fatal "ax optimize: --max-inflight > 1 is not supported in app mode (app trials share one allocation); use --max-inflight 1."
     fi
 
     # --- objective table/column (read by _knit_ax_collect via dynamic scope) ---
@@ -591,16 +607,20 @@ _knit_ax_optimize() {
     fi
     done_trials=$(knit_jq -r '.n_trials // 0' <<<"${resp}")
 
-    # --- already at budget: nothing to do ---
-    if (( done_trials >= trials )); then
-        knit_info "ax optimize: campaign '%s' already at budget (%s/%s); nothing to do." \
-            "${campaign}" "${done_trials}" "${trials}"
+    # --- already at the lifetime budget: nothing to do ---
+    if (( done_trials >= max_trials )); then
+        knit_info "ax optimize: campaign '%s' already at budget (%s/%s); nothing to do (raise it with 'ax extend')." \
+            "${campaign}" "${done_trials}" "${max_trials}"
         _knit_ax_finish "${dir}" "${campaign}" "completed" "${done_trials}"
         _knit_ax_shutdown
         trap - EXIT INT TERM
         return 0
     fi
-    local remaining=$(( trials - done_trials ))
+    # Run the remaining budget, but no more than this call's --trials when given.
+    local remaining=$(( max_trials - done_trials ))
+    if [[ -n "${per_call_trials}" ]] && (( per_call_trials < remaining )); then
+        remaining="${per_call_trials}"
+    fi
 
     # Seed the incremental progress record. _knit_ax_observe refreshes result.json
     # and the DB row after every trial, so "ax show"/"ax list" stay accurate even
@@ -629,7 +649,7 @@ _knit_ax_optimize() {
     local loop_status=0
     knit_search_loop --mode "${mode}" \
         --ask _knit_ax_ask --collect _knit_ax_collect --observe _knit_ax_observe \
-        --parallel "${parallel}" --budget "${remaining}" || loop_status=$?
+        --parallel "${max_inflight}" --budget "${remaining}" || loop_status=$?
     export KNIT_SOURCE_ID="${_saved_src_id}" KNIT_SOURCE_COMMAND="${_saved_src_cmd}"
 
     # --- resolve the best trial and record the final campaign state ---
@@ -642,8 +662,15 @@ _knit_ax_optimize() {
         best_id="${_knit_ax_trial_row[${best_idx}]}"
     fi
 
+    # A clean run that reached the lifetime budget (or drained it with no per-call
+    # cap) is "completed"; a bounded --trials call that stopped short leaves the
+    # campaign "running" (resumable, with budget remaining); a loop error "failed".
     local final_status="completed"
-    (( loop_status != 0 )) && final_status="failed"
+    if (( loop_status != 0 )); then
+        final_status="failed"
+    elif [[ -n "${per_call_trials}" ]] && (( total_done < max_trials )); then
+        final_status="running"
+    fi
     _knit_ax_finish "${dir}" "${campaign}" "${final_status}" "${total_done}" \
         "${best_id}" "${best_idx}" "${best_obj}"
     [[ -n "${best_obj}" ]] \
@@ -760,7 +787,7 @@ _knit_ax_list() {
         if [[ -f "${dir}/definition.json" ]]; then
             def="$(<"${dir}/definition.json")"
             IFS=$'\t' read -r budget objective sense \
-                < <(knit_jq -r '[ ((.trials // "")|tostring), (.objective // ""),
+                < <(knit_jq -r '[ ((.max_trials // "")|tostring), (.objective // ""),
                                   (.sense // "") ] | @tsv' <<<"${def}")
         fi
         _knit_ax_campaign_progress done_n best "${name}"
@@ -781,8 +808,8 @@ _knit_ax_list() {
 # @fn _knit_ax_show()
 #
 # Entry point for "ax show". Prints one campaign's detail — the stored command,
-# status, objective/sense, trials-done/budget, parallelism, seed, current best,
-# and opt-id — read from its campaign directory (no Ax process, no database).
+# status, objective/sense, trials-done/budget, seed, current best, and opt-id —
+# read from its campaign directory (no Ax process, no database).
 #
 # @param[in] ... All arguments as expanded by the CLI framework.
 # ------------------------------------------------------------------------------
@@ -800,10 +827,10 @@ _knit_ax_show() {
     def="$(<"${deffile}")"
     local status="unknown"
     [[ -f "${dir}/status" ]] && status="$(<"${dir}/status")"
-    local objective sense trials parallel seed opt_id
-    IFS=$'\t' read -r objective sense trials parallel seed opt_id \
-        < <(knit_jq -r '[ .objective, .sense, (.trials|tostring),
-                          (.parallel|tostring), ((.seed // "")|tostring),
+    local objective sense max_trials seed opt_id
+    IFS=$'\t' read -r objective sense max_trials seed opt_id \
+        < <(knit_jq -r '[ .objective, .sense, (.max_trials|tostring),
+                          ((.seed // "")|tostring),
                           .opt_id ] | @tsv' <<<"${def}")
     local -a ds
     mapfile -t ds < <(knit_jq -r '.downstream[]' <<<"${def}")
@@ -813,13 +840,65 @@ _knit_ax_show() {
     printf 'campaign:   %s\n' "${campaign}"
     printf 'status:     %s\n' "${status}"
     printf 'objective:  %s (%s)\n' "${objective}" "${sense}"
-    printf 'trials:     %s/%s\n' "${done_n:-0}" "${trials}"
-    printf 'parallel:   %s\n' "${parallel}"
+    printf 'trials:     %s/%s\n' "${done_n:-0}" "${max_trials}"
     [[ -n "${seed}" ]] && printf 'seed:       %s\n' "${seed}"
     printf 'best:       %s\n' "${best:-—}"
     printf 'opt-id:     %s\n' "${opt_id}"
     printf 'command:    %s\n' "${ds[*]}"
     return 0
+}
+
+# ------------------------------------------------------------------------------
+# @fn _knit_ax_extend()
+#
+# Entry point for "ax extend". Raise a prepared campaign's lifetime trial budget
+# (--max-trials) so "ax optimize" can run further trials on a campaign that has
+# reached (or is near) its budget. The new budget must be at least the number of
+# trials already run — a budget cannot drop below recorded work. Rewrites the
+# campaign's definition.json and updates its optimizations row; runs no trials.
+#
+# @param[in] ... All arguments as expanded by the CLI framework.
+# ------------------------------------------------------------------------------
+_knit_ax_extend() {
+    local campaign new_max
+    campaign=$(knit_get_parameter "campaign" "$@")
+    new_max=$(knit_get_parameter "max-trials" "$@")
+    (( new_max > 0 )) || knit_fatal "ax extend: --max-trials must be a positive integer (got '%s')." "${new_max}"
+
+    local dir
+    _knit_ax_campaign_dir dir "${campaign}"
+    [[ -d "${dir}" ]] || knit_fatal "ax extend: no campaign '%s' (%s). Run 'ax prepare' first." "${campaign}" "${dir}"
+    local deffile="${dir}/definition.json"
+    [[ -f "${deffile}" ]] || knit_fatal "ax extend: campaign '%s' has no definition.json." "${campaign}"
+
+    # The new budget may not drop below the trials already run.
+    local done_n best
+    _knit_ax_campaign_progress done_n best "${campaign}"
+    done_n="${done_n:-0}"
+    if (( new_max < done_n )); then
+        knit_fatal "ax extend: --max-trials %s is below the %s trials already run for campaign '%s'." \
+            "${new_max}" "${done_n}" "${campaign}"
+    fi
+
+    # Rewrite max_trials in the portable definition (atomic via a temp file).
+    local def tmp
+    def="$(<"${deffile}")"
+    tmp="$(mktemp)"
+    # shellcheck disable=SC2016 # $-name is a jq variable, not shell
+    if knit_jq --argjson m "${new_max}" '.max_trials = $m' <<<"${def}" > "${tmp}"; then
+        mv "${tmp}" "${deffile}"
+    else
+        rm -f "${tmp}"
+        knit_fatal "ax extend: could not update %s." "${deffile}"
+    fi
+
+    # Reflect the new budget on the campaign's optimizations row (best-effort: the
+    # row exists once the experiment is bootstrapped).
+    knit_db_update_row "optimizations" "${campaign}" "max_trials=${new_max}" \
+        2>/dev/null || true
+
+    knit_info "ax extend: campaign '%s' budget raised to %s trials (%s run so far)." \
+        "${campaign}" "${new_max}" "${done_n}"
 }
 
 # ------------------------------------------------------------------------------
