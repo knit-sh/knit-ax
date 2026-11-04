@@ -112,6 +112,39 @@ _prepare_demo() {
     [[ "$output" == *"already run"* ]]
 }
 
+@test "extend above the trials run flips a completed campaign back to running" {
+    _prepare_demo
+    # A campaign that spent its budget: 8/8 trials, status completed.
+    printf '{"trials_done":8,"best":{"index":null,"objective":null,"id":""}}\n' \
+        > "${CAMPAIGNS}/demo/result.json"
+    printf 'completed\n' > "${CAMPAIGNS}/demo/status"
+    "${_KNIT_SQLITE_EXE}" "${_KNIT_DATABASE}" \
+        "UPDATE optimizations SET status='completed' WHERE id='demo';"
+
+    run knit ax extend --campaign demo --max-trials 12
+    [ "$status" -eq 0 ]
+    # Headroom added: the campaign is resumable, so status becomes running.
+    [ "$(cat "${CAMPAIGNS}/demo/status")" = "running" ]
+    [ "$("${_KNIT_SQLITE_EXE}" "${_KNIT_DATABASE}" \
+        "SELECT status FROM optimizations WHERE id='demo';")" = "running" ]
+}
+
+@test "extend to exactly the trials run leaves a completed campaign completed" {
+    _prepare_demo
+    printf '{"trials_done":8,"best":{"index":null,"objective":null,"id":""}}\n' \
+        > "${CAMPAIGNS}/demo/result.json"
+    printf 'completed\n' > "${CAMPAIGNS}/demo/status"
+    "${_KNIT_SQLITE_EXE}" "${_KNIT_DATABASE}" \
+        "UPDATE optimizations SET status='completed' WHERE id='demo';"
+
+    # No headroom (new budget == trials already run): status is left untouched.
+    run knit ax extend --campaign demo --max-trials 8
+    [ "$status" -eq 0 ]
+    [ "$(cat "${CAMPAIGNS}/demo/status")" = "completed" ]
+    [ "$("${_KNIT_SQLITE_EXE}" "${_KNIT_DATABASE}" \
+        "SELECT status FROM optimizations WHERE id='demo';")" = "completed" ]
+}
+
 # ---------- ax optimize (pre-loop guards) ----------
 
 @test "optimize on a missing campaign fatals with a helpful message" {

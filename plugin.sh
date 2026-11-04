@@ -897,6 +897,19 @@ _knit_ax_extend() {
     knit_db_update_row "optimizations" "${campaign}" "max_trials=${new_max}" \
         2>/dev/null || true
 
+    # A campaign that spent its old budget was stamped "completed"; raising the
+    # budget above the trials already run makes it resumable again, so flip the
+    # status back to "running" (the plugin's "stopped, budget remaining" status, as
+    # left by a bounded 'ax optimize --trials' call) --- otherwise 'ax show' would
+    # keep reporting "completed" even though the next 'ax optimize' will continue.
+    # Extending to exactly the trials already run adds no headroom, so the terminal
+    # status is left untouched.
+    if (( new_max > done_n )); then
+        printf 'running\n' > "${dir}/status"
+        knit_db_update_row "optimizations" "${campaign}" "status=running" \
+            2>/dev/null || true
+    fi
+
     knit_info "ax extend: campaign '%s' budget raised to %s trials (%s run so far)." \
         "${campaign}" "${new_max}" "${done_n}"
 }
