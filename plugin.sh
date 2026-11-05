@@ -314,6 +314,9 @@ _knit_ax_discover() {
         "Run at most this many more trials this call (default: run to the campaign's --max-trials)."
     knit_with_optional "max-inflight:integer" "1" \
         "Max trials in flight for this call (job mode only; app mode runs sequentially). Per-call; not recorded."
+    knit_with_flag "show-progress" \
+        "Show a live full-width progress bar over the trial budget; two bars (current + campaign) when --trials is set (TTY only)." \
+        --no-record
     knit_done
 
     # --- ax extend: raise a prepared campaign's trial budget -----------------
@@ -466,6 +469,48 @@ _knit_ax_prepare() {
 }
 
 # ------------------------------------------------------------------------------
+# @fn _knit_ax_progress_draw()
+#
+# Redraw the "ax optimize" progress bar(s) from the live per-call counters in the
+# enclosing _knit_ax_optimize frame (dynamic scope). A no-op unless --show-progress
+# was given. The counters are:
+#   _knit_ax_pb_total     this call's budget (the remaining budget = total cells)
+#   _knit_ax_pb_base      campaign trials already done before this call
+#   _knit_ax_pb_max       the campaign's lifetime budget (--max-trials)
+#   _knit_ax_pb_asked     trials proposed/submitted this call
+#   _knit_ax_pb_ok        trials observed with a usable objective this call
+#   _knit_ax_pb_fail      trials observed failed/penalized this call
+#   _knit_ax_pb_twobar    "true" to show the two-bar (current + campaign) display
+# Running = asked - ok - fail (submitted but not yet observed). When --trials was
+# given (twobar), the campaign bar is the current bar shifted by the base baseline;
+# otherwise a single campaign bar is shown (this call drains the whole remainder).
+# ------------------------------------------------------------------------------
+_knit_ax_progress_draw() {
+    [[ "${_knit_ax_pb_show:-false}" == "true" ]] || return 0
+    local running=$(( _knit_ax_pb_asked - _knit_ax_pb_ok - _knit_ax_pb_fail ))
+    (( running < 0 )) && running=0
+
+    if [[ "${_knit_ax_pb_twobar}" == "true" ]]; then
+        local crem=$(( _knit_ax_pb_total - _knit_ax_pb_ok - _knit_ax_pb_fail - running ))
+        (( crem < 0 )) && crem=0
+        local gdone=$(( _knit_ax_pb_base + _knit_ax_pb_ok ))
+        local grem=$(( _knit_ax_pb_max - gdone - _knit_ax_pb_fail - running ))
+        (( grem < 0 )) && grem=0
+        knit_progress_bar2 "optimize: ${campaign}" \
+            "${_knit_ax_pb_ok}" "${running}" "${_knit_ax_pb_fail}" "${crem}" "current" \
+            "${gdone}" "${running}" "${_knit_ax_pb_fail}" "${grem}" "campaign"
+    else
+        # Single campaign bar: this call drains the whole remaining budget, so the
+        # campaign baseline is pre-filled and the current progress rides on top.
+        local gdone=$(( _knit_ax_pb_base + _knit_ax_pb_ok ))
+        local grem=$(( _knit_ax_pb_max - gdone - _knit_ax_pb_fail - running ))
+        (( grem < 0 )) && grem=0
+        knit_progress_bar "optimize: ${campaign}" \
+            "${gdone}" "${running}" "${_knit_ax_pb_fail}" "${grem}"
+    fi
+}
+
+# ------------------------------------------------------------------------------
 # @fn _knit_ax_optimize()
 #
 # Entry point for "ax optimize". Reads a prepared campaign's definition, starts
@@ -486,10 +531,11 @@ _knit_ax_prepare() {
 # @param[in] ... All arguments as expanded by the CLI framework.
 # ------------------------------------------------------------------------------
 _knit_ax_optimize() {
-    local campaign per_call_trials max_inflight
+    local campaign per_call_trials max_inflight show_progress
     campaign=$(knit_get_parameter "campaign" "$@")
     per_call_trials=$(knit_get_parameter "trials" "$@")       || per_call_trials=""
     max_inflight=$(knit_get_parameter "max-inflight" "$@")    || max_inflight="1"
+    show_progress=$(knit_get_parameter "show-progress" "$@")  || show_progress="false"
     (( max_inflight > 0 )) || knit_fatal "ax optimize: --max-inflight must be a positive integer (got '%s')." "${max_inflight}"
     if [[ -n "${per_call_trials}" ]] && ! (( per_call_trials > 0 )); then
         knit_fatal "ax optimize: --trials must be a positive integer (got '%s')." "${per_call_trials}"
@@ -638,6 +684,22 @@ _knit_ax_optimize() {
     _knit_ax_finish "${dir}" "${campaign}" "running" "${_knit_ax_done}" \
         "${_knit_ax_best_id}" "${_knit_ax_best_idx}" "${_knit_ax_best_obj}"
 
+    # Progress-bar state, read by _knit_ax_progress_draw / _knit_ax_ask /
+    # _knit_ax_observe through dynamic scope. Two bars (current + campaign) only
+    # when --trials bounds this call to a slice of the campaign; otherwise a single
+    # campaign bar. Counts start at 0 for this call; the campaign baseline is the
+    # trials already done. Draw the resumed/initial baseline once.
+    # shellcheck disable=SC2034 # consumed by _knit_ax_progress_draw via dynamic scope
+    local _knit_ax_pb_show="${show_progress}"
+    # shellcheck disable=SC2034
+    local _knit_ax_pb_total="${remaining}" _knit_ax_pb_base="${done_trials}"
+    # shellcheck disable=SC2034
+    local _knit_ax_pb_max="${max_trials}"
+    local _knit_ax_pb_asked=0 _knit_ax_pb_ok=0 _knit_ax_pb_fail=0
+    local _knit_ax_pb_twobar="false"
+    [[ -n "${per_call_trials}" ]] && _knit_ax_pb_twobar="true"
+    _knit_ax_progress_draw
+
     # --- drive the shared search-core loop for the remaining budget ---
     # Stamp the trials' provenance source as the campaign row through the public
     # KNIT_SOURCE_ID / KNIT_SOURCE_COMMAND context, so each trial gets a "call"
@@ -671,6 +733,10 @@ _knit_ax_optimize() {
     elif [[ -n "${per_call_trials}" ]] && (( total_done < max_trials )); then
         final_status="running"
     fi
+    # Close the progress bar (a no-op unless --show-progress drew one) so the final
+    # frame is preserved and the best-objective line prints on a fresh line below it.
+    [[ "${show_progress}" == "true" ]] && knit_progress_bar_finish
+
     _knit_ax_finish "${dir}" "${campaign}" "${final_status}" "${total_done}" \
         "${best_id}" "${best_idx}" "${best_obj}"
     [[ -n "${best_obj}" ]] \
@@ -1476,6 +1542,14 @@ _knit_ax_ask() {
     knit_search_group_forward trial_argv "${group}"
     __knit_ret_tag="${trial_tag}"
     __knit_ret_argv=("${trial_argv[@]}")
+    # A trial has been proposed and is about to be launched: it is now "in flight".
+    # Bump the per-call asked counter and redraw (both from the _knit_ax_optimize
+    # frame via dynamic scope; the draw is a no-op unless --show-progress). Guarded
+    # so a unit test calling _knit_ax_ask in isolation does not touch the counter.
+    if [[ -n "${_knit_ax_pb_show:-}" ]]; then
+        _knit_ax_pb_asked=$(( _knit_ax_pb_asked + 1 ))
+        _knit_ax_progress_draw
+    fi
     return 0
 }
 
@@ -1543,6 +1617,17 @@ _knit_ax_observe() {
         fi
         _knit_ax_finish "${dir}" "${campaign}" "running" "${_knit_ax_done}" \
             "${_knit_ax_best_id}" "${_knit_ax_best_idx}" "${_knit_ax_best_obj}"
+        # Progress bar: a trial left flight. Count it as a usable-objective success
+        # or a failure (same split as the tell above: an objective told "ok" vs a
+        # failed/penalized trial), then redraw. No-op unless --show-progress.
+        if [[ -n "${_knit_ax_pb_show:-}" ]]; then
+            if [[ "${status}" == "completed" && -n "${objective}" ]]; then
+                _knit_ax_pb_ok=$(( _knit_ax_pb_ok + 1 ))
+            else
+                _knit_ax_pb_fail=$(( _knit_ax_pb_fail + 1 ))
+            fi
+            _knit_ax_progress_draw
+        fi
     fi
     return 0
 }

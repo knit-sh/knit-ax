@@ -279,3 +279,64 @@ PY
     # full-budget re-run.
     [ "$(_launch_count)" -eq 0 ]
 }
+
+# ---------- --show-progress ----------
+# bats runs with stderr not a TTY, so knit_progress_bar is a no-op: a run with
+# --show-progress must converge exactly as without it and leave output unchanged.
+
+@test "optimize --show-progress (single bar) is silent on a non-TTY and still converges" {
+    knit ax prepare --campaign spsingle --objective score --maximize \
+        --max-trials 5 -- submit -- train --x @domain
+    run knit ax optimize --campaign spsingle
+    local plain_status=$status plain_output=$output
+    [ "$plain_status" -eq 0 ]
+
+    # Fresh campaign with the same definition, run with the flag.
+    knit ax prepare --campaign spsingle2 --objective score --maximize \
+        --max-trials 5 -- submit -- train --x @domain
+    run knit ax optimize --campaign spsingle2 --show-progress
+    [ "$status" -eq "$plain_status" ]
+    # Same best objective reached; the bar did not disturb the loop or stdout.
+    [ "$(printf '%.0f' "$(jq -r '.best.objective' "${CAMPAIGNS}/spsingle2/result.json")")" -eq 100 ]
+    # Output is identical (no bar bytes leaked on the non-TTY).
+    [ "$output" = "$plain_output" ]
+}
+
+@test "optimize --show-progress --trials (two bars) is silent on a non-TTY and still converges" {
+    knit ax prepare --campaign sptwo --objective score --maximize \
+        --max-trials 5 -- submit -- train --x @domain
+    run knit ax optimize --campaign sptwo --trials 5
+    local plain_status=$status plain_output=$output
+    [ "$plain_status" -eq 0 ]
+
+    knit ax prepare --campaign sptwo2 --objective score --maximize \
+        --max-trials 5 -- submit -- train --x @domain
+    run knit ax optimize --campaign sptwo2 --trials 5 --show-progress
+    [ "$status" -eq "$plain_status" ]
+    [ "$(printf '%.0f' "$(jq -r '.best.objective' "${CAMPAIGNS}/sptwo2/result.json")")" -eq 100 ]
+    [ "$output" = "$plain_output" ]
+}
+
+@test "optimize --show-progress resumes without disturbing output" {
+    knit ax prepare --campaign spresume --objective score --maximize \
+        --max-trials 5 -- submit -- train --x @domain
+    # Two trials already done, then resume the rest with the flag.
+    _seed_state spresume 2
+    run knit ax optimize --campaign spresume --show-progress
+    [ "$status" -eq 0 ]
+    [ "$(printf '%.0f' "$(jq -r '.best.objective' "${CAMPAIGNS}/spresume/result.json")")" -eq 100 ]
+}
+
+# The bar's "current" budget is the REMAINING budget, min(--trials, max-trials -
+# done). When the campaign remainder is the smaller, a large --trials is capped to
+# it: the call runs only the trials the campaign has budget for.
+@test "optimize --trials is capped by the remaining campaign budget" {
+    knit ax prepare --campaign capbud --objective score --maximize \
+        --max-trials 5 -- submit -- train --x @domain
+    _seed_state capbud 4           # 4 of 5 already done; 1 remains
+    run knit ax optimize --campaign capbud --trials 10 --show-progress
+    [ "$status" -eq 0 ]
+    # Only the single remaining trial runs, not 10.
+    [ "$(_launch_count)" -eq 1 ]
+    [ "$(jq -r '.trials_done' "${CAMPAIGNS}/capbud/result.json")" -eq 5 ]
+}
