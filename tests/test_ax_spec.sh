@@ -23,6 +23,8 @@ setup() {
     knit_with_optional "lr:real"        "0.01" "learning rate" --domain '[1e-5..1.0]' --log
     knit_with_optional "batch:integer"  "32"   "batch size"    --domain '{16,32,64}'
     knit_with_optional "epochs:integer" "10"   "epochs"
+    # "nodes" collides by name with the submit dispatcher's own --nodes.
+    knit_with_optional "nodes:integer"  "1"    "graph node count" --domain '{1,2,4,8}'
     knit_with_output   "val_loss:real"  ""     "validation loss"
     knit_done
     # Register a no-domain command for the "no varying parameter" test.
@@ -75,25 +77,25 @@ _spec() {
     local spec
     spec=$(_spec "val_loss" "true" "" "" train --lr @domain --epochs 20)
     local kind vtype log
-    kind=$(jq -r '.parameters[] | select(.name=="lr") | .ax'          <<<"$spec")
-    vtype=$(jq -r '.parameters[] | select(.name=="lr") | .value_type' <<<"$spec")
-    log=$(jq -r   '.parameters[] | select(.name=="lr") | .log_scale'  <<<"$spec")
+    kind=$(jq -r '.parameters[] | select(.name=="train.lr") | .ax'          <<<"$spec")
+    vtype=$(jq -r '.parameters[] | select(.name=="train.lr") | .value_type' <<<"$spec")
+    log=$(jq -r   '.parameters[] | select(.name=="train.lr") | .log_scale'  <<<"$spec")
     [ "$kind"  = "range" ]
     [ "$vtype" = "float" ]
     [ "$log"   = "true" ]
     # Check bounds are numeric: lo < 0.001, hi == 1.0.
-    [ "$(jq '.parameters[] | select(.name=="lr") | .bounds[0] < 0.001' <<<"$spec")" = "true" ]
-    [ "$(jq '.parameters[] | select(.name=="lr") | .bounds[1] == 1'    <<<"$spec")" = "true" ]
+    [ "$(jq '.parameters[] | select(.name=="train.lr") | .bounds[0] < 0.001' <<<"$spec")" = "true" ]
+    [ "$(jq '.parameters[] | select(.name=="train.lr") | .bounds[1] == 1'    <<<"$spec")" = "true" ]
 }
 
 @test "batch @domain becomes an ordered int ChoiceParameter" {
     local spec
     spec=$(_spec "val_loss" "true" "" "" train --batch @domain --epochs 20)
     local kind vtype ordered
-    kind=$(jq -r    '.parameters[] | select(.name=="batch") | .ax'       <<<"$spec")
-    vtype=$(jq -r   '.parameters[] | select(.name=="batch") | .value_type' <<<"$spec")
-    ordered=$(jq -r '.parameters[] | select(.name=="batch") | .ordered'  <<<"$spec")
-    vals=$(jq -r    '.parameters[] | select(.name=="batch") | .values|join(",")' <<<"$spec")
+    kind=$(jq -r    '.parameters[] | select(.name=="train.batch") | .ax'       <<<"$spec")
+    vtype=$(jq -r   '.parameters[] | select(.name=="train.batch") | .value_type' <<<"$spec")
+    ordered=$(jq -r '.parameters[] | select(.name=="train.batch") | .ordered'  <<<"$spec")
+    vals=$(jq -r    '.parameters[] | select(.name=="train.batch") | .values|join(",")' <<<"$spec")
     [ "$kind"    = "choice" ]
     [ "$vtype"   = "int" ]
     [ "$ordered" = "true" ]
@@ -107,10 +109,10 @@ _spec() {
     spec=$(_spec "val_loss" "true" "" "" train \
         --optimizer '{sgd,adam}' --epochs 20)
     local kind vtype ordered vals
-    kind=$(jq -r    '.parameters[] | select(.name=="optimizer") | .ax'          <<<"$spec")
-    vtype=$(jq -r   '.parameters[] | select(.name=="optimizer") | .value_type'  <<<"$spec")
-    ordered=$(jq -r '.parameters[] | select(.name=="optimizer") | .ordered'     <<<"$spec")
-    vals=$(jq -r    '.parameters[] | select(.name=="optimizer") | .values|join(",")' <<<"$spec")
+    kind=$(jq -r    '.parameters[] | select(.name=="train.optimizer") | .ax'          <<<"$spec")
+    vtype=$(jq -r   '.parameters[] | select(.name=="train.optimizer") | .value_type'  <<<"$spec")
+    ordered=$(jq -r '.parameters[] | select(.name=="train.optimizer") | .ordered'     <<<"$spec")
+    vals=$(jq -r    '.parameters[] | select(.name=="train.optimizer") | .values|join(",")' <<<"$spec")
     [ "$kind"    = "choice" ]
     [ "$vtype"   = "str" ]
     [ "$ordered" = "false" ]
@@ -122,11 +124,11 @@ _spec() {
     spec=$(_spec "val_loss" "true" "" "" train \
         --dropout '[0.1..0.9]' --epochs 20)
     local kind vtype log lo hi
-    kind=$(jq -r  '.parameters[] | select(.name=="dropout") | .ax'          <<<"$spec")
-    vtype=$(jq -r '.parameters[] | select(.name=="dropout") | .value_type'  <<<"$spec")
-    log=$(jq -r   '.parameters[] | select(.name=="dropout") | .log_scale'   <<<"$spec")
-    lo=$(jq -r    '.parameters[] | select(.name=="dropout") | .bounds[0]'   <<<"$spec")
-    hi=$(jq -r    '.parameters[] | select(.name=="dropout") | .bounds[1]'   <<<"$spec")
+    kind=$(jq -r  '.parameters[] | select(.name=="train.dropout") | .ax'          <<<"$spec")
+    vtype=$(jq -r '.parameters[] | select(.name=="train.dropout") | .value_type'  <<<"$spec")
+    log=$(jq -r   '.parameters[] | select(.name=="train.dropout") | .log_scale'   <<<"$spec")
+    lo=$(jq -r    '.parameters[] | select(.name=="train.dropout") | .bounds[0]'   <<<"$spec")
+    hi=$(jq -r    '.parameters[] | select(.name=="train.dropout") | .bounds[1]'   <<<"$spec")
     [ "$kind"  = "range" ]
     [ "$vtype" = "float" ]
     [ "$log"   = "false" ]
@@ -139,8 +141,8 @@ _spec() {
     spec=$(_spec "val_loss" "true" "" "" train \
         --batch '{2,4,8}' --epochs 20)
     local vtype ordered
-    vtype=$(jq -r   '.parameters[] | select(.name=="batch") | .value_type' <<<"$spec")
-    ordered=$(jq -r '.parameters[] | select(.name=="batch") | .ordered'    <<<"$spec")
+    vtype=$(jq -r   '.parameters[] | select(.name=="train.batch") | .value_type' <<<"$spec")
+    ordered=$(jq -r '.parameters[] | select(.name=="train.batch") | .ordered'    <<<"$spec")
     [ "$vtype"   = "int" ]
     [ "$ordered" = "true" ]
 }
@@ -152,10 +154,10 @@ _spec() {
     local spec
     spec=$(_spec "val_loss" "true" "" "" globcmd --data '@glob:*.glomtest')
     local kind vtype ordered vals
-    kind=$(jq -r    '.parameters[] | select(.name=="data") | .ax'         <<<"$spec")
-    vtype=$(jq -r   '.parameters[] | select(.name=="data") | .value_type' <<<"$spec")
-    ordered=$(jq -r '.parameters[] | select(.name=="data") | .ordered'    <<<"$spec")
-    vals=$(jq -r    '.parameters[] | select(.name=="data") | .values|sort|join(",")' <<<"$spec")
+    kind=$(jq -r    '.parameters[] | select(.name=="globcmd.data") | .ax'         <<<"$spec")
+    vtype=$(jq -r   '.parameters[] | select(.name=="globcmd.data") | .value_type' <<<"$spec")
+    ordered=$(jq -r '.parameters[] | select(.name=="globcmd.data") | .ordered'    <<<"$spec")
+    vals=$(jq -r    '.parameters[] | select(.name=="globcmd.data") | .values|sort|join(",")' <<<"$spec")
     [ "$kind"    = "choice" ]
     [ "$vtype"   = "str" ]
     [ "$ordered" = "false" ]
@@ -167,10 +169,10 @@ _spec() {
     local spec
     spec=$(_spec "val_loss" "true" "" "" globcmd --config @domain)
     local kind vtype ordered vals
-    kind=$(jq -r    '.parameters[] | select(.name=="config") | .ax'         <<<"$spec")
-    vtype=$(jq -r   '.parameters[] | select(.name=="config") | .value_type' <<<"$spec")
-    ordered=$(jq -r '.parameters[] | select(.name=="config") | .ordered'    <<<"$spec")
-    vals=$(jq -r    '.parameters[] | select(.name=="config") | .values|sort|join(",")' <<<"$spec")
+    kind=$(jq -r    '.parameters[] | select(.name=="globcmd.config") | .ax'         <<<"$spec")
+    vtype=$(jq -r   '.parameters[] | select(.name=="globcmd.config") | .value_type' <<<"$spec")
+    ordered=$(jq -r '.parameters[] | select(.name=="globcmd.config") | .ordered'    <<<"$spec")
+    vals=$(jq -r    '.parameters[] | select(.name=="globcmd.config") | .values|sort|join(",")' <<<"$spec")
     [ "$kind"    = "choice" ]
     [ "$vtype"   = "str" ]
     [ "$ordered" = "false" ]
@@ -239,7 +241,7 @@ _spec() {
     local spec
     spec=$(_spec "val_loss" "true" "" "" train --lr @domain --epochs 20)
     local cnt
-    cnt=$(jq '.parameters | map(select(.name=="epochs")) | length' <<<"$spec")
+    cnt=$(jq '.parameters | map(select(.name=="train.epochs")) | length' <<<"$spec")
     [ "$cnt" = "0" ]
 }
 
@@ -250,7 +252,7 @@ _spec() {
     # With --fill domain (BO default), lr has a declared domain → it varies.
     spec=$(_spec "val_loss" "true" "" "" train --epochs 20)
     local cnt
-    cnt=$(jq '.parameters | map(select(.name=="lr")) | length' <<<"$spec")
+    cnt=$(jq '.parameters | map(select(.name=="train.lr")) | length' <<<"$spec")
     [ "$cnt" = "1" ]
 }
 
@@ -258,13 +260,26 @@ _spec() {
     local spec
     spec=$(_spec "val_loss" "true" "" "" train --lr @domain --epochs 20)
     local kind vtype
-    kind=$(jq -r  '.parameters[] | select(.name=="lr") | .ax'          <<<"$spec")
-    vtype=$(jq -r '.parameters[] | select(.name=="lr") | .value_type'  <<<"$spec")
+    kind=$(jq -r  '.parameters[] | select(.name=="train.lr") | .ax'          <<<"$spec")
+    vtype=$(jq -r '.parameters[] | select(.name=="train.lr") | .value_type'  <<<"$spec")
     [ "$kind"  = "range" ]
     [ "$vtype" = "float" ]
 }
 
 # ---------- submit mode: resolves the job inside the downstream ----------
+
+@test "the same option name in two segments yields two qualified Ax dimensions" {
+    local spec
+    spec=$(_spec "val_loss" "true" "" "" \
+        submit --nodes '{1,2}' -- train --nodes @domain)
+    # submit.nodes is the dispatcher's literal axis; train.nodes resolves against
+    # the job's declared domain. Both coexist under command-qualified names.
+    [ "$(jq '[.parameters[]|select(.name=="submit.nodes")]|length' <<<"$spec")" = "1" ]
+    [ "$(jq '[.parameters[]|select(.name=="train.nodes")]|length'  <<<"$spec")" = "1" ]
+    # submit.nodes keeps its inline {1,2}; train.nodes uses the job's {1,2,4,8}.
+    [ "$(jq -r '.parameters[]|select(.name=="submit.nodes")|.values|join(",")' <<<"$spec")" = "1,2" ]
+    [ "$(jq -r '.parameters[]|select(.name=="train.nodes")|.values|join(",")'  <<<"$spec")" = "1,2,4,8" ]
+}
 
 @test "submit -- train downstream resolves to the job parameters" {
     local spec
@@ -273,7 +288,7 @@ _spec() {
     cnt=$(jq '.parameters | length' <<<"$spec")
     [ "$cnt" -ge 1 ]
     local kind
-    kind=$(jq -r '.parameters[] | select(.name=="lr") | .ax' <<<"$spec")
+    kind=$(jq -r '.parameters[] | select(.name=="train.lr") | .ax' <<<"$spec")
     [ "$kind" = "range" ]
 }
 

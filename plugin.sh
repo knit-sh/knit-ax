@@ -593,13 +593,19 @@ _knit_ax_optimize() {
     local -a template axes rawtokens
     local -A seen_map
     knit_search_scan template axes rawtokens seen_map "" "${downstream[@]}"
+    # Keyed by the command-qualified axis identity ("<segment>.<option>"), so a
+    # proposed value binds to the right slot even when two segments share an
+    # option name. The qualified names match those _knit_ax_build_spec_json gives
+    # Ax, so Ax proposes values under the same keys.
     local -A slot_by_param=()
-    local ax_i ax_kind ax_slot ax_name
+    local ax_i ax_kind ax_slot ax_name ax_seg ax_qname
     # shellcheck disable=SC2034
     for ((ax_i=0; ax_i<${#axes[@]}; ax_i++)); do
-        read -r ax_kind ax_slot ax_name <<< "${axes[ax_i]}"
+        read -r ax_kind ax_slot ax_name ax_seg <<< "${axes[ax_i]}"
         case "${ax_kind}" in
-            literal|domain) slot_by_param["${ax_name}"]="${ax_slot}" ;;
+            literal|domain)
+                knit_search_axis_qualify ax_qname "${ax_seg}" "${ax_name}"
+                slot_by_param["${ax_qname}"]="${ax_slot}" ;;
         esac
     done
 
@@ -1114,110 +1120,139 @@ _knit_ax_build_spec_json() {
     local -A seen_map
     knit_search_scan template axes rawtokens seen_map "" "${downstream[@]}"
 
-    # Build a name→axis-index map for explicit literal-token axes.
-    local -A axis_by_param=()
-    local ax_i ax_kind ax_name
+    local -a ax_params_json=()
+    # Qualified names already emitted, so pass 2 does not duplicate a marker.
+    local -A handled=()
+
+    # 3a. Pass 1: each explicit axis (a literal token or an @domain marker) is
+    # classified against the command of its own segment, so a dispatcher-side
+    # axis (e.g. "submit --nodes ...") and a target-side axis of the same name
+    # stay distinct Ax dimensions under command-qualified names.
+    local ax_i ax_kind ax_slot ax_name ax_seg qname segcmd ptype
     for ((ax_i=0; ax_i<${#axes[@]}; ax_i++)); do
-        read -r ax_kind _ ax_name <<< "${axes[ax_i]}"
-        [[ "${ax_kind}" == "literal" ]] && axis_by_param["${ax_name}"]="${ax_i}"
+        read -r ax_kind ax_slot ax_name ax_seg <<< "${axes[ax_i]}"
+        case "${ax_kind}" in literal|domain) ;; *) continue ;; esac
+
+        knit_search_axis_qualify qname "${ax_seg}" "${ax_name}"
+        knit_search_segment_command segcmd "${ax_seg}" "${downstream[@]}"
+        if [[ -z "${segcmd}" ]]; then
+            knit_fatal "ax optimize: axis '%s' is in segment '%s', which is not a command in the downstream." \
+                "${ax_name}" "${ax_seg}"
+        fi
+
+        local pj vtype
+        if [[ "${ax_kind}" == "literal" ]]; then
+            # Literal token: inspect the raw token to determine the Ax type.
+            local raw="${rawtokens[ax_i]}"
+            local -A tok_desc
+            local -a tok_vals
+            knit_search_parse_token tok_desc tok_vals "${raw}"
+            knit_parameter_type ptype "${segcmd}" "${ax_name}" || ptype=""
+            case "${tok_desc[kind]}" in
+                range)
+                    # For [lo..hi] without a type hint, infer from the bounds.
+                    _knit_ax_value_type vtype "${ptype}" \
+                        "${tok_desc[lo]}" "${tok_desc[hi]}"
+                    # shellcheck disable=SC2016 # $-names in the filter are jq variables, not shell
+                    pj=$(knit_jq -cn \
+                        --arg  name  "${qname}" \
+                        --arg  vtype "${vtype}" \
+                        --argjson lo   "${tok_desc[lo]}" \
+                        --argjson hi   "${tok_desc[hi]}" \
+                        '{"name":$name,"ax":"range","value_type":$vtype,
+                          "bounds":[$lo,$hi],"log_scale":false}')
+                    ;;
+                list)
+                    _knit_ax_value_type vtype "${ptype}" "${tok_vals[@]}"
+                    _knit_ax_choice_json pj "${qname}" "${vtype}" "${tok_vals[@]}"
+                    ;;
+                glob)
+                    local -a gvals
+                    _knit_ax_glob_values gvals "${tok_desc[glob]}"
+                    _knit_ax_choice_json pj "${qname}" "str" "${gvals[@]}"
+                    ;;
+            esac
+        else
+            # @domain marker: use the declared domain from the segment's command.
+            local dk dt dlo dhi dlog dglob
+            # shellcheck disable=SC2034 # dstep is a required output slot; Ax uses bounds not step
+            local dstep
+            local -a dvals
+            if ! knit_parameter_space dk dt dlo dhi dvals dstep dlog dglob \
+                    "${segcmd}" "${ax_name}"; then
+                knit_fatal "ax optimize: @domain '%s' on segment '%s' has no declared domain. Give it a value, or declare it with --domain." \
+                    "${ax_name}" "${ax_seg}"
+            fi
+            _knit_ax_value_type vtype "${dt}" "${dvals[@]}"
+            case "${dk}" in
+                range)
+                    # shellcheck disable=SC2016 # $name/$vtype/$lo/$hi/$log are jq variables, not shell
+                    pj=$(knit_jq -cn \
+                        --arg  name  "${qname}" \
+                        --arg  vtype "${vtype}" \
+                        --argjson lo   "${dlo}" \
+                        --argjson hi   "${dhi}" \
+                        --argjson log  "${dlog}" \
+                        '{"name":$name,"ax":"range","value_type":$vtype,
+                          "bounds":[$lo,$hi],"log_scale":$log}')
+                    ;;
+                list)
+                    _knit_ax_choice_json pj "${qname}" "${vtype}" "${dvals[@]}"
+                    ;;
+                glob)
+                    local -a gvals
+                    _knit_ax_glob_values gvals "${dglob}"
+                    _knit_ax_choice_json pj "${qname}" "str" "${gvals[@]}"
+                    ;;
+            esac
+        fi
+        ax_params_json+=("${pj}")
+        handled["${qname}"]=1
     done
 
-    # 3. List target parameters and classify each one.
-    local -a params ax_params_json=()
+    # 3b. Pass 2: a TARGET parameter left unspecified on the line that has a
+    # declared domain is varied over that domain (BO's --fill domain default).
+    # It carries no call-site token, so _knit_ax_reconstruct appends it.
+    local -a params
     knit_command_parameters params "${mangled}"
-
-    local param token has_domain resolved ptype
+    local param token qname2
     for param in "${params[@]}"; do
         token="${seen_map[${param}]:-unspecified}"
+        [[ "${token}" != "unspecified" ]] && continue
+        knit_search_axis_qualify qname2 "${target}" "${param}"
+        [[ -v handled["${qname2}"] ]] && continue
 
-        # Check for a declared domain without calling a private function.
-        has_domain="false"
         local dk dt dlo dhi dlog dglob
         # shellcheck disable=SC2034 # dstep is a required output slot; Ax uses bounds not step
         local dstep
         local -a dvals
-        if knit_parameter_space dk dt dlo dhi dvals dstep dlog dglob \
-                "${mangled}" "${param}"; then
-            has_domain="true"
-        fi
-
-        knit_search_resolve_fill resolved "domain" "${token}" "${has_domain}"
-
-        case "${resolved}" in
-            default) continue ;;
-
-            explicit)
-                # Plain scalar (e.g. --epochs 20) → fixed, skip.
-                [[ ! -v axis_by_param["${param}"] ]] && continue
-
-                # Literal token: inspect the raw token to determine Ax type.
-                local ai="${axis_by_param[${param}]}"
-                local raw="${rawtokens[${ai}]}"
-                local -A tok_desc
-                local -a tok_vals
-                knit_search_parse_token tok_desc tok_vals "${raw}"
-
-                knit_parameter_type ptype "${mangled}" "${param}" || ptype=""
-
-                local pj
-                case "${tok_desc[kind]}" in
-                    range)
-                        local vtype
-                        # For [lo..hi] without a type hint, infer from the bounds.
-                        _knit_ax_value_type vtype "${ptype}" \
-                            "${tok_desc[lo]}" "${tok_desc[hi]}"
-                        # shellcheck disable=SC2016 # $-names in the filter are jq variables, not shell
-                        pj=$(knit_jq -cn \
-                            --arg  name  "${param}" \
-                            --arg  vtype "${vtype}" \
-                            --argjson lo   "${tok_desc[lo]}" \
-                            --argjson hi   "${tok_desc[hi]}" \
-                            '{"name":$name,"ax":"range","value_type":$vtype,
-                              "bounds":[$lo,$hi],"log_scale":false}')
-                        ;;
-                    list)
-                        local vtype
-                        _knit_ax_value_type vtype "${ptype}" "${tok_vals[@]}"
-                        _knit_ax_choice_json pj "${param}" "${vtype}" "${tok_vals[@]}"
-                        ;;
-                    glob)
-                        local -a gvals
-                        _knit_ax_glob_values gvals "${tok_desc[glob]}"
-                        _knit_ax_choice_json pj "${param}" "str" "${gvals[@]}"
-                        ;;
-                esac
-                ax_params_json+=("${pj}")
+        knit_parameter_space dk dt dlo dhi dvals dstep dlog dglob \
+            "${mangled}" "${param}" || continue
+        local pj vtype
+        _knit_ax_value_type vtype "${dt}" "${dvals[@]}"
+        case "${dk}" in
+            range)
+                # shellcheck disable=SC2016 # $name/$vtype/$lo/$hi/$log are jq variables, not shell
+                pj=$(knit_jq -cn \
+                    --arg  name  "${qname2}" \
+                    --arg  vtype "${vtype}" \
+                    --argjson lo   "${dlo}" \
+                    --argjson hi   "${dhi}" \
+                    --argjson log  "${dlog}" \
+                    '{"name":$name,"ax":"range","value_type":$vtype,
+                      "bounds":[$lo,$hi],"log_scale":$log}')
                 ;;
-
-            domain)
-                # Use the declared domain from knit_parameter_space.
-                local vtype
-                _knit_ax_value_type vtype "${dt}" "${dvals[@]}"
-                local pj
-                case "${dk}" in
-                    range)
-                        # shellcheck disable=SC2016 # $name/$vtype/$lo/$hi/$log are jq variables, not shell
-                        pj=$(knit_jq -cn \
-                            --arg  name  "${param}" \
-                            --arg  vtype "${vtype}" \
-                            --argjson lo   "${dlo}" \
-                            --argjson hi   "${dhi}" \
-                            --argjson log  "${dlog}" \
-                            '{"name":$name,"ax":"range","value_type":$vtype,
-                              "bounds":[$lo,$hi],"log_scale":$log}')
-                        ;;
-                    list)
-                        _knit_ax_choice_json pj "${param}" "${vtype}" "${dvals[@]}"
-                        ;;
-                    glob)
-                        local -a gvals
-                        _knit_ax_glob_values gvals "${dglob}"
-                        _knit_ax_choice_json pj "${param}" "str" "${gvals[@]}"
-                        ;;
-                esac
-                ax_params_json+=("${pj}")
+            list)
+                _knit_ax_choice_json pj "${qname2}" "${vtype}" "${dvals[@]}"
+                ;;
+            glob)
+                local -a gvals
+                _knit_ax_glob_values gvals "${dglob}"
+                _knit_ax_choice_json pj "${qname2}" "str" "${gvals[@]}"
                 ;;
         esac
+        ax_params_json+=("${pj}")
+        handled["${qname2}"]=1
     done
 
     # 4. Validate: at least one varying parameter.
@@ -1479,8 +1514,9 @@ _knit_ax_shutdown() {
 # call site (a literal domain or an @domain marker) has a template slot, so its
 # value replaces that slot in place; a parameter that varies only through its
 # declared domain (BO's --fill domain default, no token) has no slot and is
-# appended as "--<name> <value>". Parameter names fold hyphens to underscores;
-# knit accepts either spelling on the resulting line.
+# appended as "--<option> <value>", with the segment qualifier stripped. Ax
+# parameter names are command-qualified ("<segment>.<option>") and fold hyphens
+# to underscores; knit accepts either spelling on the resulting line.
 #
 # @param[out] $1 The reconstructed argv array.
 # @param[in] $2 The proposed parameters as a JSON object ({"name":value,...}).
@@ -1494,14 +1530,18 @@ _knit_ax_reconstruct() {
     local -n __knit_tmpl=$3
     local -n __knit_slot=$4
     __knit_ret=("${__knit_tmpl[@]}")
-    local name value norm
+    local name value norm opt
     while IFS=$'\t' read -r name value; do
         [[ -z "${name}" ]] && continue
+        # Ax parameter names are command-qualified ("<segment>.<option>").
         norm="${name//-/_}"
         if [[ -v __knit_slot["${norm}"] ]]; then
             __knit_ret["${__knit_slot[${norm}]}"]="${value}"
         else
-            __knit_ret+=("--${norm}" "${value}")
+            # No call-site slot (a declared-domain parameter with no token): append
+            # it as "--<option> <value>", stripping the segment qualifier.
+            opt="${norm##*.}"
+            __knit_ret+=("--${opt}" "${value}")
         fi
     done < <(knit_jq -r 'to_entries[] | "\(.key)\t\(.value)"' <<<"${params_json}")
 }

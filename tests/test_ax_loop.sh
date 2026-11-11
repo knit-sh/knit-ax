@@ -54,6 +54,20 @@ teardown() {
     [[ "$joined" == *"--batch 64"* ]]
 }
 
+@test "reconstruct binds qualified names to their own slots and strips on append" {
+    # Two same-named axes in different segments bind to different slots; a
+    # slotless qualified parameter is appended with its segment stripped.
+    local -a template=(submit --nodes @domain -- train --nodes @domain)
+    local -A slot_by_param=([submit.nodes]=2 [train.nodes]=6)
+    local -a argv
+    _knit_ax_reconstruct argv \
+        '{"submit.nodes":1,"train.nodes":8,"train.lr":0.03}' template slot_by_param
+    [ "${argv[2]}" = "1" ]   # submit.nodes
+    [ "${argv[6]}" = "8" ]   # train.nodes
+    # train.lr has no slot -> appended as "--lr" (segment stripped), not "--train.lr".
+    [ "${argv[*]: -2}" = "--lr 0.03" ]
+}
+
 # ---------- _knit_ax_ask ----------
 
 @test "ask reconstructs the next trial and returns its index as the tag" {
