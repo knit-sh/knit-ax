@@ -38,11 +38,13 @@ it). Two commands drive it, mirroring `prepare` then `submit drain`:
 - `ax prepare --campaign <name> [OPTIONS] -- <downstream>` validates the request,
   resolves the objective, builds the search space, and records the campaign —
   it runs no trial, and fails if the campaign name already exists.
-- `ax optimize --campaign <name> [--trials K] [--max-inflight M]` starts, or
-  resumes, the ask/tell loop toward the budget. First run and every resume are
-  the same call, so a campaign interrupted at walltime continues from its
-  persisted state. `--trials` bounds this call; `--max-inflight` sets its
-  concurrency (per call, default 1).
+- `ax optimize --campaign <name> [--trials K] [--max-inflight M] [--show-progress]`
+  starts, or resumes, the ask/tell loop toward the budget. First run and every
+  resume are the same call, so a campaign interrupted at walltime continues from
+  its persisted state. `--trials` bounds this call; `--max-inflight` sets its
+  concurrency (per call, default 1). On a terminal, `--show-progress` draws a live
+  progress bar over the trial budget — two bars (this call + the whole campaign)
+  when `--trials` bounds the call, a single campaign bar otherwise.
 - `ax extend --campaign <name> --max-trials <N>` raises a campaign's lifetime
   budget (never below the trials already run) so `ax optimize` can search further.
 - `ax list` and `ax show --campaign <name>` report progress and the current best
@@ -71,6 +73,13 @@ with `knit ax extend --campaign lr-sweep --max-trials 80`. `--sobol-trials` sets
 how many quasi-random trials explore before the model engages, and
 `--on-failure penalize` tells the model a fixed penalty for a failed trial
 instead of dropping it.
+
+**Dimensions can span the submission and the job.** A search dimension may be a
+submission option as well as a job argument — for example sweeping the node count
+with `submit --nodes '{1,2,4}'` alongside `--lr @domain` on the job. Axes are
+named by their command (`submit.nodes` vs `train.nodes`), so a submission option
+and a same-named job option stay two distinct dimensions, each resolved against
+its own command's declared domain.
 
 **Range types are inferred from the bounds.** When the swept parameter declares
 no explicit type, an integer-bounded range domain — `--domain '[0..12]'` —
