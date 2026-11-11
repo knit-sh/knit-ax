@@ -158,6 +158,15 @@ _knit_is_builtin
 # (e.g. torch has no 3.15 wheel), so the sync fails "no wheel for the current
 # platform". 3.12 is a well-supported PyTorch target with wheels on every
 # platform knit runs on.
+#
+# torch is pinned to the PyTorch CPU wheel index. ax-platform pulls torch (via
+# botorch), and torch's default wheels declare the full CUDA runtime as
+# dependencies (nvidia-cudnn, nvidia-cublas, ... — multiple GB). Ax/BoTorch fit
+# their small Gaussian-process surrogates on CPU; the GPU stack is never used by
+# this driver, and downloading it can exhaust disk on a CPU-only cluster. The CPU
+# index drops it (~5 GB -> ~1 GB, zero nvidia packages). torch is listed as a
+# direct dependency because tool.uv.sources is only honored for direct deps, not
+# transitive ones; its version still floats within what botorch requires.
 knit_with_uv_env <<'EOF'
 [project]
 name = "knit-ax-driver"
@@ -166,7 +175,16 @@ requires-python = ">=3.12,<3.13"
 dependencies = [
     "ax-platform>=0.4.0,<1.4",
     "numpy",
+    "torch",
 ]
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch-cpu" }
 EOF
 knit_done
 
