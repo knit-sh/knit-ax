@@ -12,6 +12,7 @@ resume   {"cmd":"resume", "path":<state.json>,         "state_path":<path>}
 ask      {"cmd":"ask",    "n":<int>}
 tell     {"cmd":"tell",   "index":<int>, "objective":<float>, "status":"ok"|"penalized"|"failed"}
 best     {"cmd":"best"}
+predict  {"cmd":"predict","points":[{<axis>:<value>, ...}, ...]}
 save     {"cmd":"save",   "path":<path>}
 shutdown {"cmd":"shutdown"}
 
@@ -372,6 +373,34 @@ class AxDriver:
             "n_trials": self._n_trials(),
         })
 
+    def cmd_predict(self, req: dict) -> None:
+        points = req.get("points", [])
+        # predict is a read-only query: fit the current surrogate on the told
+        # data WITHOUT generating a trial. Every predict runs in a fresh process
+        # that resumed the campaign from disk, so the generation strategy's
+        # adapter is not built yet; predict would then fail with "not
+        # predictive". fit() builds the adapter from the experiment's data, for
+        # a model campaign (qNIPV node) and an optimize campaign (BoTorch node)
+        # alike. With too few trials to fit a surrogate it raises, which is the
+        # honest signal that the model is not ready.
+        try:
+            self._client._generation_strategy.fit(
+                experiment=self._client._experiment
+            )
+            preds = self._client.predict(points=points)
+        except Exception as exc:
+            raise RuntimeError(
+                f"the surrogate model cannot predict yet ({exc}); "
+                "run more trials with 'ax optimize'"
+            ) from exc
+        out: List[dict] = []
+        for pred in preds:
+            out.append({
+                metric: {"mean": float(mean), "sem": float(sem)}
+                for metric, (mean, sem) in pred.items()
+            })
+        self._send({"predictions": out})
+
     def cmd_save(self, req: dict) -> None:
         path = req["path"]
         Path(path).parent.mkdir(parents=True, exist_ok=True)
@@ -393,6 +422,7 @@ class AxDriver:
             "ask": self.cmd_ask,
             "tell": self.cmd_tell,
             "best": self.cmd_best,
+            "predict": self.cmd_predict,
             "save": self.cmd_save,
             "shutdown": self.cmd_shutdown,
         }

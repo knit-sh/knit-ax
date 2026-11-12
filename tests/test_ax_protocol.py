@@ -499,5 +499,80 @@ class TestAxModelMode(unittest.TestCase):
                          f"duplicate trial indices after resume: {seen}")
 
 
+class TestAxPredict(unittest.TestCase):
+    """The predict command over a fitted surrogate, for a model campaign and an
+    optimize campaign alike. Every predict resumes from saved state in a fresh
+    process (as "ax predict" does), so these also prove the driver fits the
+    surrogate on the told data before predicting — the adapter is not built by a
+    bare load."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        reason = _ax_unavailable_reason()
+        if reason:
+            raise unittest.SkipTest(f"ax-platform not available: {reason}")
+        cls.tmpdir = tempfile.mkdtemp(prefix="knit_ax_predict_test_")
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        import shutil
+        shutil.rmtree(cls.tmpdir, ignore_errors=True)
+
+    def _run_and_save(self, spec: dict, state: str, n: int = 6) -> None:
+        with DriverProcess() as dp:
+            dp.init(state_path=state, spec=spec)
+            for _ in range(n):
+                ask = dp.send({"cmd": "ask", "n": 1})
+                trial = ask["trials"][0]
+                dp.send({"cmd": "tell", "index": trial["index"],
+                          "objective": _objective(trial["params"]), "status": "ok"})
+            dp.send({"cmd": "save", "path": state})
+
+    def _assert_prediction(self, resp: dict, metric: str) -> None:
+        self.assertIn("predictions", resp, resp)
+        self.assertEqual(len(resp["predictions"]), 1, resp)
+        row = resp["predictions"][0]
+        self.assertIn(metric, row, row)
+        self.assertIsInstance(row[metric]["mean"], float)
+        self.assertIsInstance(row[metric]["sem"], float)
+        self.assertGreaterEqual(row[metric]["sem"], 0.0)
+
+    def test_predict_model_resume(self) -> None:
+        state = os.path.join(self.tmpdir, "predict_model.json")
+        self._run_and_save(SPEC_MODEL, state)
+        with DriverProcess() as dp:
+            dp.send({"cmd": "resume", "path": state, "state_path": state})
+            resp = dp.send({"cmd": "predict", "points": [{"x": 2.0}]})
+        self._assert_prediction(resp, "y")
+
+    def test_predict_optimize_resume(self) -> None:
+        state = os.path.join(self.tmpdir, "predict_opt.json")
+        self._run_and_save(SPEC_1D, state)
+        with DriverProcess() as dp:
+            dp.send({"cmd": "resume", "path": state, "state_path": state})
+            resp = dp.send({"cmd": "predict", "points": [{"x": 2.0}]})
+        self._assert_prediction(resp, "y")
+
+    def test_predict_near_optimum_is_small(self) -> None:
+        """objective = (x-2)^2; the surrogate's predicted mean near x=2 is well
+        below its value at the bounds (~9 at x=-5), a sanity check that predict
+        reflects the told data rather than returning noise."""
+        state = os.path.join(self.tmpdir, "predict_acc.json")
+        self._run_and_save(SPEC_MODEL, state, n=8)
+        with DriverProcess() as dp:
+            dp.send({"cmd": "resume", "path": state, "state_path": state})
+            resp = dp.send({"cmd": "predict", "points": [{"x": 2.0}]})
+        mean = resp["predictions"][0]["y"]["mean"]
+        self.assertLess(mean, 4.0, resp)
+
+    def test_predict_out_of_space_errors(self) -> None:
+        state = os.path.join(self.tmpdir, "predict_oob.json")
+        self._run_and_save(SPEC_MODEL, state)
+        with DriverProcess() as dp:
+            dp.send({"cmd": "resume", "path": state, "state_path": state})
+            resp = dp.send({"cmd": "predict", "points": [{"x": 99.0}]})
+        self.assertIn("error", resp, resp)
+
+
 if __name__ == "__main__":
     unittest.main()

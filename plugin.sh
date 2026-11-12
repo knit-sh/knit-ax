@@ -366,6 +366,26 @@ _knit_ax_discover() {
     knit_with_required "campaign:string" \
         "The campaign to show."
     knit_done
+
+    # --- ax predict: query a campaign's fitted surrogate at a point ----------
+    knit_register "ax:predict" _knit_ax_predict \
+        "Predict the objective at a point from a campaign's fitted surrogate model."
+    # A read-only query: it starts an Ax coprocess to ask the model, but records
+    # no row and declares no table, so it stays out of the provenance graph.
+    knit_without_provenance
+    knit_with_required "campaign:string" \
+        "The campaign whose model to query (its campaigns/<name>/ directory must exist)."
+    knit_with_flag "variance" \
+        "Also report the posterior variance." --no-record
+    knit_with_flag "std" \
+        "Also report the posterior standard deviation." --no-record
+    knit_with_flag "interval" \
+        "Also report the 95% confidence interval (mean +/- 1.96 * sem)." --no-record
+    knit_with_flag "json" \
+        "Emit a structured JSON object (objective, mean, sem, variance, ci95)." --no-record
+    knit_with_dispatch "point" \
+        "The prepare command with a concrete in-space value at each varying-axis position."
+    knit_done
 }
 
 # ------------------------------------------------------------------------------
@@ -1041,6 +1061,363 @@ _knit_ax_extend() {
 
     knit_info "ax extend: campaign '%s' budget raised to %s trials (%s run so far)." \
         "${campaign}" "${new_max}" "${done_n}"
+}
+
+# ------------------------------------------------------------------------------
+# @fn _knit_ax_parse_assignments()
+#
+# Parse a downstream command line into its explicit "--option value" assignments,
+# keyed by the command-qualified option identity ("<segment>.<option>", hyphens
+# folded to underscores) — the same names knit-ax gives Ax. The first non-option
+# token of each "--"-delimited segment names that segment (the dispatcher keyword,
+# then each target); a "--option" token binds the following non-option token as
+# its value (or an inline "--option=value"). A flag — a "--option" with no value
+# token after it — is recorded with an empty value. knit commands take no
+# positional arguments, so every non-option token is either a segment name or an
+# option value, which makes this parse unambiguous without a flag lookup.
+#
+# @param[out] 1 Name of the associative array to receive qualified-option -> value.
+# @param[in] 2 Name of the array holding the downstream tokens.
+# ------------------------------------------------------------------------------
+_knit_ax_parse_assignments() {
+    local -n __knit_ret_map=$1
+    local -n __knit_toks=$2
+    __knit_ret_map=()
+    local i tok seg="" capture=1 prev_opt="" qn opt val
+    for ((i=0; i<${#__knit_toks[@]}; i++)); do
+        tok="${__knit_toks[i]}"
+        if [[ "${capture}" == 1 && "${tok}" != --* ]]; then
+            seg="${tok}"
+            capture=0
+            prev_opt=""
+            continue
+        fi
+        if [[ "${tok}" == --* ]]; then
+            # A pending option with no value token was a flag: record it empty.
+            if [[ -n "${prev_opt}" ]]; then
+                knit_search_axis_qualify qn "${seg}" "${prev_opt}"
+                __knit_ret_map["${qn}"]=""
+                prev_opt=""
+            fi
+            if [[ "${tok}" == "--" ]]; then
+                capture=1
+            elif [[ "${tok}" == *=* ]]; then
+                opt="${tok#--}"; opt="${opt%%=*}"; opt="${opt//-/_}"
+                val="${tok#*=}"
+                knit_search_axis_qualify qn "${seg}" "${opt}"
+                __knit_ret_map["${qn}"]="${val}"
+            else
+                prev_opt="${tok#--}"; prev_opt="${prev_opt//-/_}"
+            fi
+            continue
+        fi
+        # A value token for the pending "--option".
+        if [[ -n "${prev_opt}" ]]; then
+            knit_search_axis_qualify qn "${seg}" "${prev_opt}"
+            __knit_ret_map["${qn}"]="${tok}"
+            prev_opt=""
+        fi
+    done
+    # A trailing flag at the very end of the line.
+    if [[ -n "${prev_opt}" ]]; then
+        knit_search_axis_qualify qn "${seg}" "${prev_opt}"
+        __knit_ret_map["${qn}"]=""
+    fi
+}
+
+# ------------------------------------------------------------------------------
+# @fn _knit_ax_build_point()
+#
+# Validate an "ax predict" command against the campaign it queries, and build the
+# prediction point. The point is written as the campaign's own command with a
+# concrete in-space value at each varying-axis position (command-qualified axis
+# names disambiguate "submit --nodes" from "job --nodes"). The two commands must
+# be identical except at the axis positions:
+#
+#   - a different dispatcher/target command shape is fatal;
+#   - a fixed (non-axis) option that differs, is missing, or is extra is fatal;
+#   - an axis value outside its domain is fatal (exact membership for a
+#     choice/list axis, in-bounds for a continuous range).
+#
+# Every varying axis must carry a concrete value; it is cast by the axis value
+# type and placed in the point under the axis's qualified name (the name Ax
+# knows). The spec's .parameters[] is the authoritative axis set and domain.
+#
+# @param[out] 1 Name of the variable to receive the point JSON ({"<axis>":v,...}).
+# @param[in] 2 The campaign's Ax spec JSON (its .parameters[] are the axes).
+# @param[in] 3 Name of the array holding the campaign's downstream tokens.
+# @param[in] 4 Name of the array holding the predict command tokens.
+# ------------------------------------------------------------------------------
+_knit_ax_build_point() {
+    local -n __knit_ret=$1
+    local spec="$2"
+    local camp_name="$3" pred_name="$4"
+    local -n __knit_camp=$3
+    local -n __knit_pred=$4
+
+    # --- command shape: dispatcher + target command must match ---
+    # shellcheck disable=SC2034 # c_target/p_target are output slots, unused here
+    local c_mangled c_disp c_target p_mangled p_disp p_target
+    knit_search_resolve_target c_mangled c_disp c_target "${__knit_camp[@]}"
+    knit_search_resolve_target p_mangled p_disp p_target "${__knit_pred[@]}"
+    if [[ "${p_disp//-/_}" != "${c_disp//-/_}" || "${p_mangled}" != "${c_mangled}" ]]; then
+        knit_fatal "ax predict: the requested command (%s) does not match the command expected by the campaign (%s)." \
+            "${__knit_pred[*]}" "${__knit_camp[*]}"
+    fi
+
+    # --- explicit assignments on each side, keyed by qualified option ---
+    local -A camp_map pred_map
+    _knit_ax_parse_assignments camp_map "${camp_name}"
+    _knit_ax_parse_assignments pred_map "${pred_name}"
+
+    # --- the axis set and per-axis kind/value_type, from the spec ---
+    local -A is_axis axis_kind axis_vtype
+    local -a axis_order=()
+    local qn kind vtype
+    while IFS=$'\t' read -r qn kind vtype; do
+        [[ -z "${qn}" ]] && continue
+        is_axis["${qn}"]=1
+        axis_kind["${qn}"]="${kind}"
+        axis_vtype["${qn}"]="${vtype}"
+        axis_order+=("${qn}")
+    done < <(knit_jq -r '.parameters[] | [ .name, .ax, .value_type ] | @tsv' <<<"${spec}")
+
+    # --- fixed (non-axis) tokens must match exactly on both sides ---
+    local opt cval pval
+    for qn in "${!camp_map[@]}"; do
+        [[ -v is_axis["${qn}"] ]] && continue
+        opt="${qn##*.}"; opt="${opt//_/-}"
+        cval="${camp_map[${qn}]}"
+        if [[ ! -v pred_map["${qn}"] ]]; then
+            knit_fatal "ax predict: the requested command is missing \"--%s %s\", which the campaign's parameter space fixes." \
+                "${opt}" "${cval}"
+        fi
+        pval="${pred_map[${qn}]}"
+        if [[ "${pval}" != "${cval}" ]]; then
+            knit_fatal "ax predict: the requested command's argument \"--%s %s\" doesn't match the campaign's parameter space (--%s %s)." \
+                "${opt}" "${pval}" "${opt}" "${cval}"
+        fi
+    done
+    for qn in "${!pred_map[@]}"; do
+        [[ -v is_axis["${qn}"] ]] && continue
+        [[ -v camp_map["${qn}"] ]] && continue
+        opt="${qn##*.}"; opt="${opt//_/-}"
+        knit_fatal "ax predict: the requested command's argument \"--%s %s\" is not part of the campaign's command." \
+            "${opt}" "${pred_map[${qn}]}"
+    done
+
+    # --- every axis needs a concrete, in-domain value; build the point ---
+    local -a objs=()
+    local val lo hi numre member found allowed
+    for qn in "${axis_order[@]}"; do
+        opt="${qn##*.}"; opt="${opt//_/-}"
+        if [[ ! -v pred_map["${qn}"] ]]; then
+            knit_fatal "ax predict: no value for \"--%s\", which varies in the campaign; predict needs a concrete in-space value there." \
+                "${opt}"
+        fi
+        val="${pred_map[${qn}]}"
+        kind="${axis_kind[${qn}]}"
+        vtype="${axis_vtype[${qn}]}"
+        if [[ "${kind}" == "range" ]]; then
+            # shellcheck disable=SC2016 # $n and the \(...) are jq, not shell
+            read -r lo hi < <(knit_jq -r --arg n "${qn}" \
+                '.parameters[]|select(.name==$n)|.bounds|"\(.[0]) \(.[1])"' <<<"${spec}")
+            numre='^-?[0-9]+([.][0-9]+)?([eE][+-]?[0-9]+)?$'
+            [[ "${vtype}" == "int" ]] && numre='^-?[0-9]+$'
+            if ! [[ "${val}" =~ ${numre} ]] \
+               || ! awk -v v="${val}" -v lo="${lo}" -v hi="${hi}" 'BEGIN{exit !(v>=lo && v<=hi)}'; then
+                knit_fatal "ax predict: \"--%s %s\" is outside the campaign's domain for that axis ([%s..%s])." \
+                    "${opt}" "${val}" "${lo}" "${hi}"
+            fi
+        else
+            # choice/list: exact membership (numeric-aware for int/float).
+            local members_json
+            # shellcheck disable=SC2016 # $n is a jq variable, not shell
+            members_json=$(knit_jq -r --arg n "${qn}" \
+                '.parameters[]|select(.name==$n)|.values[]' <<<"${spec}")
+            found="false"
+            while IFS= read -r member; do
+                if [[ "${vtype}" == "str" ]]; then
+                    [[ "${val}" == "${member}" ]] && { found="true"; break; }
+                elif awk -v a="${val}" -v b="${member}" 'BEGIN{exit !(a==b)}'; then
+                    found="true"; break
+                fi
+            done <<<"${members_json}"
+            if [[ "${found}" != "true" ]]; then
+                # shellcheck disable=SC2016 # $n is a jq variable, not shell
+                allowed=$(knit_jq -r --arg n "${qn}" \
+                    '.parameters[]|select(.name==$n)|.values|map(tostring)|join(", ")' <<<"${spec}")
+                knit_fatal "ax predict: \"--%s %s\" is not one of the campaign's values for that axis ({%s})." \
+                    "${opt}" "${val}" "${allowed}"
+            fi
+        fi
+        # Cast by value type and add to the point under the qualified name.
+        # shellcheck disable=SC2016 # $k/$v are jq variables, not shell
+        case "${vtype}" in
+            int|float)
+                objs+=("$(knit_jq -cn --arg k "${qn}" --argjson v "${val}" '{($k):$v}')") ;;
+            *)
+                objs+=("$(knit_jq -cn --arg k "${qn}" --arg v "${val}" '{($k):$v}')") ;;
+        esac
+    done
+    __knit_ret=$(printf '%s\n' "${objs[@]}" | knit_jq -sc 'add // {}')
+}
+
+# ------------------------------------------------------------------------------
+# @fn _knit_ax_predict()
+#
+# Entry point for "ax predict". Reads a prepared, run campaign's definition, casts
+# the mirrored "-- <command>" into a prediction point (validated against the
+# campaign by _knit_ax_build_point), resumes the Ax driver from the campaign's
+# persisted state, and asks the fitted surrogate for the objective's predicted
+# mean and standard error at that point. The default output is the bare predicted
+# mean; --variance / --std / --interval add detail and --json emits a structured
+# object. predict is a read-only query: it records no row and runs no trials.
+#
+# @param[in] ... All arguments as expanded by the CLI framework.
+# ------------------------------------------------------------------------------
+_knit_ax_predict() {
+    local args=("$@")
+    local idx
+    idx=$(knit_extra_index "${args[@]}")
+    local -a point_cmd
+    point_cmd=("${args[@]:idx}")
+    if [[ ${#point_cmd[@]} -eq 0 ]]; then
+        knit_fatal "ax predict: a command is required after -- (the prepare command with a concrete value at each varying-axis position)."
+    fi
+
+    local campaign variance_flag std_flag interval_flag json_flag
+    campaign=$(knit_get_parameter "campaign" "${args[@]}")
+    variance_flag=$(knit_get_parameter "variance" "${args[@]}")  || variance_flag="false"
+    std_flag=$(knit_get_parameter "std" "${args[@]}")            || std_flag="false"
+    interval_flag=$(knit_get_parameter "interval" "${args[@]}")  || interval_flag="false"
+    json_flag=$(knit_get_parameter "json" "${args[@]}")          || json_flag="false"
+
+    local dir
+    _knit_ax_campaign_dir dir "${campaign}"
+    [[ -d "${dir}" ]] || knit_fatal "ax predict: no campaign '%s' (%s)." "${campaign}" "${dir}"
+    local deffile="${dir}/definition.json"
+    [[ -f "${deffile}" ]] || knit_fatal "ax predict: campaign '%s' has no definition.json." "${campaign}"
+    local state_path="${dir}/state.json"
+    [[ -f "${state_path}" ]] || knit_fatal "ax predict: campaign '%s' has no trials yet; run 'ax optimize --campaign %s' first (predict needs a fitted model)." \
+        "${campaign}" "${campaign}"
+
+    # --- read back the stored definition ---
+    local def
+    def="$(<"${deffile}")"
+    local objective minimize mode seed sobol
+    IFS=$'\001' read -r objective minimize mode seed sobol \
+        < <(knit_jq -r '[ .objective, (.minimize|tostring), (.mode // "optimize"),
+                          ((.seed // "")|tostring),
+                          ((.sobol_trials // "")|tostring) ] | join("\u0001")' <<<"${def}")
+    local -a downstream
+    mapfile -t downstream < <(knit_jq -r '.downstream[]' <<<"${def}")
+
+    # --- rebuild the spec (the authoritative axis set + domains) and the point ---
+    local spec
+    spec=$(_knit_ax_build_spec_json "${objective}" "${minimize}" "${mode}" "${seed}" \
+        "${sobol}" "${downstream[@]}") || exit $?
+    local point
+    _knit_ax_build_point point "${spec}" downstream point_cmd
+
+    # --- start the Ax coprocess, resume the campaign, predict ---
+    local driver_prefix
+    _knit_ax_ensure_driver driver_prefix \
+        || knit_fatal "ax predict: could not build the _ax-driver environment."
+    local driver_log="${dir}/ax-driver.log"
+    _knit_ax_start_driver "${driver_prefix}" "${driver_log}"
+    trap '_knit_ax_shutdown' EXIT
+
+    local resp resume_req
+    # shellcheck disable=SC2016 # $p is a jq variable, not shell
+    resume_req=$(knit_jq -cn --arg p "${state_path}" '{cmd:"resume",path:$p,state_path:$p}')
+    _knit_ax_rpc resp "${resume_req}"
+    if [[ "$(knit_jq -r '.status // "error"' <<<"${resp}")" != "ok" ]]; then
+        knit_fatal "ax predict: the Ax driver failed to load campaign '%s': %s (see %s)." \
+            "${campaign}" "$(knit_jq -r '.error // "unknown error"' <<<"${resp}")" "${driver_log}"
+    fi
+
+    local predict_req
+    # shellcheck disable=SC2016 # $pt is a jq variable, not shell
+    predict_req=$(knit_jq -cn --argjson pt "${point}" '{cmd:"predict",points:[$pt]}')
+    _knit_ax_rpc resp "${predict_req}"
+    _knit_ax_shutdown
+    trap - EXIT
+
+    if knit_jq -e 'has("error")' >/dev/null 2>&1 <<<"${resp}"; then
+        knit_fatal "ax predict: could not predict for campaign '%s': %s." \
+            "${campaign}" "$(knit_jq -r '.error' <<<"${resp}")"
+    fi
+
+    # --- extract the objective's predicted mean and standard error ---
+    local obj_name="${objective##*:}"
+    local mean sem
+    # shellcheck disable=SC2016 # $m and the \(...) are jq, not shell
+    read -r mean sem < <(knit_jq -r --arg m "${obj_name}" \
+        '.predictions[0] | (.[$m] // (to_entries[0].value)) | "\(.mean) \(.sem)"' <<<"${resp}")
+    if [[ -z "${mean}" || "${mean}" == "null" ]]; then
+        knit_fatal "ax predict: the Ax driver returned no prediction for objective '%s'." "${obj_name}"
+    fi
+
+    _knit_ax_emit_prediction "${obj_name}" "${mean}" "${sem}" \
+        "${variance_flag}" "${std_flag}" "${interval_flag}" "${json_flag}"
+}
+
+# ------------------------------------------------------------------------------
+# @fn _knit_ax_emit_prediction()
+#
+# Render an "ax predict" result. The default is the bare predicted mean. --json
+# wins when set and emits a structured object (objective, mean, sem, variance,
+# ci95). Otherwise --variance / --std / --interval append a parenthetical to the
+# mean: the posterior variance (sem^2), the standard deviation (sem), and the 95%
+# confidence interval (mean +/- 1.96 * sem). Numbers are shown with %.6g.
+#
+# @param[in] obj_name The objective metric name.
+# @param[in] mean The predicted mean.
+# @param[in] sem The predicted standard error.
+# @param[in] want_variance "true" to include the variance.
+# @param[in] want_std "true" to include the standard deviation.
+# @param[in] want_interval "true" to include the 95% confidence interval.
+# @param[in] want_json "true" to emit a JSON object instead of the text form.
+# ------------------------------------------------------------------------------
+_knit_ax_emit_prediction() {
+    local obj_name="$1" mean="$2" sem="$3"
+    local want_variance="$4" want_std="$5" want_interval="$6" want_json="$7"
+
+    local variance lo hi mean_g sem_g var_g lo_g hi_g
+    variance=$(awk -v s="${sem}" 'BEGIN{printf "%.10g", s*s}')
+    lo=$(awk -v m="${mean}" -v s="${sem}" 'BEGIN{printf "%.10g", m-1.96*s}')
+    hi=$(awk -v m="${mean}" -v s="${sem}" 'BEGIN{printf "%.10g", m+1.96*s}')
+    mean_g=$(awk -v v="${mean}" 'BEGIN{printf "%.6g", v}')
+    sem_g=$(awk -v v="${sem}" 'BEGIN{printf "%.6g", v}')
+    var_g=$(awk -v v="${variance}" 'BEGIN{printf "%.6g", v}')
+    lo_g=$(awk -v v="${lo}" 'BEGIN{printf "%.6g", v}')
+    hi_g=$(awk -v v="${hi}" 'BEGIN{printf "%.6g", v}')
+
+    if [[ "${want_json}" == "true" ]]; then
+        # shellcheck disable=SC2016 # $-names are jq variables, not shell
+        knit_jq -cn \
+            --arg     obj  "${obj_name}" \
+            --argjson mean "${mean}" \
+            --argjson sem  "${sem}" \
+            --argjson var  "${variance}" \
+            --argjson lo   "${lo}" \
+            --argjson hi   "${hi}" \
+            '{objective:$obj, mean:$mean, sem:$sem, variance:$var, ci95:[$lo,$hi]}'
+        return 0
+    fi
+
+    local -a detail=()
+    [[ "${want_variance}" == "true" ]] && detail+=("var ${var_g}")
+    [[ "${want_std}" == "true" ]]      && detail+=("±${sem_g}")
+    [[ "${want_interval}" == "true" ]] && detail+=("95% CI ${lo_g}–${hi_g}")
+    if [[ ${#detail[@]} -eq 0 ]]; then
+        printf '%s\n' "${mean_g}"
+    else
+        local joined
+        printf -v joined '%s, ' "${detail[@]}"
+        printf '%s  (%s)\n' "${mean_g}" "${joined%, }"
+    fi
 }
 
 # ------------------------------------------------------------------------------
