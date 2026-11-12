@@ -245,8 +245,9 @@ _knit_ax_build_driver_at_bootstrap() {
 # provisioned by bootstrap itself, so this runs once that is in place).
 knit_command_run_after "bootstrap" _knit_ax_build_driver_at_bootstrap
 
-# Enum type for the optimization sense (minimize / maximize).
-knit_enum "ax_sense" "minimize" "maximize"
+# Enum type for the optimization sense. "model" is not a direction: it marks an
+# active-learning campaign that fits a surrogate instead of optimizing.
+knit_enum "ax_sense" "minimize" "maximize" "model"
 
 # Enum type for the on-failure policy (ignore / penalize).
 knit_enum "ax_on_failure" "ignore" "penalize"
@@ -296,6 +297,9 @@ _knit_ax_discover() {
         "Minimize the objective (default)." --no-record
     knit_with_flag "maximize" \
         "Maximize the objective." --no-record
+    knit_with_flag "model" \
+        "Fit a surrogate model of the objective by active learning, instead of optimizing it. Cannot be combined with --minimize or --maximize." \
+        --no-record
     knit_with_optional "sobol-trials:integer" "" \
         "Quasi-random exploration trials before the GP model engages." --no-record
     knit_with_optional "on-failure:ax_on_failure" "ignore" \
@@ -392,11 +396,13 @@ _knit_ax_prepare() {
     fi
 
     # --- options ---
-    local campaign objective maximize_flag seed sobol max_trials
+    local campaign objective minimize_flag maximize_flag model_flag seed sobol max_trials
     local on_failure penalty
     campaign=$(knit_get_parameter "campaign" "${args[@]}")
     objective=$(knit_get_parameter "objective" "${args[@]}")     || objective=""
+    minimize_flag=$(knit_get_parameter "minimize" "${args[@]}")  || minimize_flag="false"
     maximize_flag=$(knit_get_parameter "maximize" "${args[@]}")  || maximize_flag="false"
+    model_flag=$(knit_get_parameter "model" "${args[@]}")        || model_flag="false"
     seed=$(knit_get_parameter "seed" "${args[@]}")               || seed=""
     sobol=$(knit_get_parameter "sobol-trials" "${args[@]}")      || sobol=""
     max_trials=$(knit_get_parameter "max-trials" "${args[@]}")   || max_trials=""
@@ -410,10 +416,25 @@ _knit_ax_prepare() {
         knit_fatal "ax prepare: --on-failure penalize requires --penalty <value> (the objective value told to Ax for a failed trial)."
     fi
 
-    local minimize="true"
-    [[ "${maximize_flag}" == "true" ]] && minimize="false"
-    local sense="minimize"
-    [[ "${minimize}" == "false" ]] && sense="maximize"
+    # Campaign mode and optimization sense. --model fits a surrogate by active
+    # learning and has no direction, so it cannot be combined with --minimize or
+    # --maximize. An optimize campaign minimizes by default; --maximize flips it.
+    local mode="optimize" sense minimize
+    if [[ "${model_flag}" == "true" ]]; then
+        if [[ "${minimize_flag}" == "true" || "${maximize_flag}" == "true" ]]; then
+            knit_fatal "ax prepare: --model cannot be combined with --minimize or --maximize (a model campaign fits a surrogate; it has no optimization sense)."
+        fi
+        mode="model"
+        sense="model"
+        # The sense is irrelevant in model mode (the driver ignores it); record a
+        # definite value so the spec the driver later builds is well-formed.
+        minimize="false"
+    else
+        minimize="true"
+        [[ "${maximize_flag}" == "true" ]] && minimize="false"
+        sense="minimize"
+        [[ "${minimize}" == "false" ]] && sense="maximize"
+    fi
 
     # Validate that the downstream is a submit/run line (fail fast at prepare).
     # The resolved mode itself is not needed here — concurrency (--max-inflight)
@@ -427,7 +448,7 @@ _knit_ax_prepare() {
     local obj_table obj_column
     _knit_ax_resolve_objective obj_table obj_column "${objective}" "${downstream[@]}"
     local spec
-    spec=$(_knit_ax_build_spec_json "${objective}" "${minimize}" "${seed}" \
+    spec=$(_knit_ax_build_spec_json "${objective}" "${minimize}" "${mode}" "${seed}" \
         "${sobol}" "${downstream[@]}") || exit $?
 
     # --- create the campaign directory (no-clobber) ---
@@ -459,6 +480,7 @@ _knit_ax_prepare() {
         --arg  objective "${objective}" \
         --argjson minimize "${minimize}" \
         --arg  sense     "${sense}" \
+        --arg  mode      "${mode}" \
         --argjson max_trials "${max_trials}" \
         --argjson seed     "${seed:-null}" \
         --argjson sobol    "${sobol:-null}" \
@@ -467,7 +489,7 @@ _knit_ax_prepare() {
         --arg  opt_id    "${campaign}" \
         --argjson downstream "${downstream_json}" \
         '{campaign:$campaign, objective:$objective, minimize:$minimize,
-          sense:$sense, max_trials:$max_trials, seed:$seed,
+          sense:$sense, mode:$mode, max_trials:$max_trials, seed:$seed,
           sobol_trials:$sobol, on_failure:$on_failure, penalty:$penalty,
           downstream:$downstream, opt_id:$opt_id}' > "${dir}/definition.json"
     printf 'prepared\n' > "${dir}/status"
@@ -571,18 +593,22 @@ _knit_ax_optimize() {
     # --- read back the stored definition ---
     local def
     def="$(<"${deffile}")"
-    local objective minimize max_trials seed sobol
+    local objective minimize max_trials seed sobol campaign_mode
     # on_failure / penalty are read by _knit_ax_observe via dynamic scope.
     # shellcheck disable=SC2034
     local on_failure penalty
     # Join on a non-whitespace delimiter (SOH, ): a whitespace delimiter
     # such as a tab is collapsed by "read", so an empty seed/sobol field would
     # shift every later field left (e.g. on_failure landing in seed).
-    IFS=$'\001' read -r objective minimize max_trials seed sobol on_failure penalty \
+    # campaign_mode is the campaign kind ("optimize"/"model"), distinct from the
+    # job/app loop mode below; default "optimize" for a definition written before
+    # the mode field existed.
+    IFS=$'\001' read -r objective minimize max_trials seed sobol on_failure penalty campaign_mode \
         < <(knit_jq -r '[ .objective, (.minimize|tostring), (.max_trials|tostring),
                           ((.seed // "")|tostring),
                           ((.sobol_trials // "")|tostring), .on_failure,
-                          ((.penalty // "")|tostring) ] | join("\u0001")' <<<"${def}")
+                          ((.penalty // "")|tostring),
+                          (.mode // "optimize") ] | join("\u0001")' <<<"${def}")
     local -a downstream
     mapfile -t downstream < <(knit_jq -r '.downstream[]' <<<"${def}")
 
@@ -601,8 +627,8 @@ _knit_ax_optimize() {
 
     # --- search-space spec (used on a fresh campaign's init) ---
     local spec
-    spec=$(_knit_ax_build_spec_json "${objective}" "${minimize}" "${seed}" \
-        "${sobol}" "${downstream[@]}") || exit $?
+    spec=$(_knit_ax_build_spec_json "${objective}" "${minimize}" "${campaign_mode}" \
+        "${seed}" "${sobol}" "${downstream[@]}") || exit $?
 
     # --- scan the downstream into a template + the varying-slot map, read by
     # _knit_ax_ask/_knit_ax_reconstruct via dynamic scope ---
@@ -698,12 +724,21 @@ _knit_ax_optimize() {
     # The best is seeded from the driver so a resumed campaign shows its prior best
     # at once (best_id is unknown for prior-run trials, so it stays empty until a
     # new trial of this run beats it).
+    # A model campaign has no "best": the driver's best command still returns the
+    # min/max observed, but recording it would fabricate an optimum. Skip the best
+    # everywhere (this seed, per-trial _knit_ax_observe, and the final record) when
+    # the campaign is a model campaign. _knit_ax_campaign_mode is read by
+    # _knit_ax_observe through dynamic scope.
+    # shellcheck disable=SC2034
+    local _knit_ax_campaign_mode="${campaign_mode}"
     local _knit_ax_done="${done_trials}"
     local _knit_ax_best_obj="" _knit_ax_best_idx="" _knit_ax_best_id=""
-    local seed_best
-    _knit_ax_rpc seed_best '{"cmd":"best"}'
-    _knit_ax_best_obj=$(knit_jq -r '.best.objective // empty' <<<"${seed_best}")
-    _knit_ax_best_idx=$(knit_jq -r '.best.index // empty' <<<"${seed_best}")
+    if [[ "${campaign_mode}" != "model" ]]; then
+        local seed_best
+        _knit_ax_rpc seed_best '{"cmd":"best"}'
+        _knit_ax_best_obj=$(knit_jq -r '.best.objective // empty' <<<"${seed_best}")
+        _knit_ax_best_idx=$(knit_jq -r '.best.index // empty' <<<"${seed_best}")
+    fi
     _knit_ax_finish "${dir}" "${campaign}" "running" "${_knit_ax_done}" \
         "${_knit_ax_best_id}" "${_knit_ax_best_idx}" "${_knit_ax_best_obj}"
 
@@ -738,13 +773,18 @@ _knit_ax_optimize() {
     export KNIT_SOURCE_ID="${_saved_src_id}" KNIT_SOURCE_COMMAND="${_saved_src_cmd}"
 
     # --- resolve the best trial and record the final campaign state ---
-    local best_resp best_obj best_idx best_id="" total_done
+    local best_resp best_obj="" best_idx="" best_id="" total_done
     _knit_ax_rpc best_resp '{"cmd":"best"}'
-    best_obj=$(knit_jq -r '.best.objective // empty' <<<"${best_resp}")
-    best_idx=$(knit_jq -r '.best.index // empty' <<<"${best_resp}")
     total_done=$(knit_jq -r '.n_trials // 0' <<<"${best_resp}")
-    if [[ -n "${best_idx}" && -v _knit_ax_trial_row["${best_idx}"] ]]; then
-        best_id="${_knit_ax_trial_row[${best_idx}]}"
+    # A model campaign records no best (see the seed above); leave the fields
+    # empty so _knit_ax_finish writes nulls and the "best objective" line below is
+    # skipped. total_done still comes from the same response.
+    if [[ "${campaign_mode}" != "model" ]]; then
+        best_obj=$(knit_jq -r '.best.objective // empty' <<<"${best_resp}")
+        best_idx=$(knit_jq -r '.best.index // empty' <<<"${best_resp}")
+        if [[ -n "${best_idx}" && -v _knit_ax_trial_row["${best_idx}"] ]]; then
+            best_id="${_knit_ax_trial_row[${best_idx}]}"
+        fi
     fi
 
     # A clean run that reached the lifetime budget (or drained it with no per-call
@@ -1114,13 +1154,16 @@ _knit_ax_glob_values() {
 #
 # @param[in] objective The objective output name, possibly "table:name".
 # @param[in] minimize "true" to minimize, "false" to maximize.
+# @param[in] mode Campaign mode: "optimize" (chase the objective) or "model"
+#            (fit a surrogate by active learning). Emitted so the driver picks
+#            the generation strategy; empty is treated as "optimize".
 # @param[in] seed RNG seed (empty → omitted from spec).
 # @param[in] sobol_trials Sobol initialization count (empty → omitted).
 # @param[in] ... The downstream tokens (after the outer "--").
 # ------------------------------------------------------------------------------
 _knit_ax_build_spec_json() {
-    local objective="$1" minimize="$2" seed="$3" sobol_trials="$4"
-    shift 4
+    local objective="$1" minimize="$2" mode="$3" seed="$4" sobol_trials="$5"
+    shift 5
     local -a downstream=("$@")
 
     # 1. Resolve the target command.
@@ -1302,11 +1345,12 @@ _knit_ax_build_spec_json() {
     knit_jq -cn \
         --arg  obj_name  "${obj_name}" \
         --argjson minimize "${minimize}" \
+        --arg  mode_v    "${mode:-optimize}" \
         --argjson seed_v   "${seed:-null}" \
         --argjson sobol_v  "${sobol_trials:-null}" \
         --argjson params   "${params_arr}" \
         '{objective:{name:$obj_name,minimize:$minimize},
-          seed:$seed_v, sobol_trials:$sobol_v,
+          mode:$mode_v, seed:$seed_v, sobol_trials:$sobol_v,
           parameters:$params}
          | with_entries(select(.value != null))'
 }
@@ -1657,8 +1701,9 @@ _knit_ax_observe() {
     # Incremental progress: count this trial and refresh the best-so-far, then
     # rewrite the campaign's result.json / DB row so "ax show" is accurate even
     # if the run is killed before _knit_ax_finish. _knit_ax_done, _knit_ax_best_*,
-    # dir, campaign, and minimize come from the _knit_ax_optimize frame through
-    # dynamic scope. Best tracks the best OBSERVED objective here; the clean
+    # dir, campaign, minimize, and _knit_ax_campaign_mode come from the
+    # _knit_ax_optimize frame through dynamic scope. Best tracks the best OBSERVED
+    # objective here (skipped for a model campaign); the clean
     # finish still records Ax's authoritative model-best. The guard makes the
     # recording a no-op when observe runs outside an optimize frame (a unit test
     # that calls it in isolation to check only the tell): with no campaign there
@@ -1666,7 +1711,11 @@ _knit_ax_observe() {
     # shellcheck disable=SC2154
     if [[ -n "${dir:-}" && -n "${campaign:-}" ]]; then
         _knit_ax_done=$(( _knit_ax_done + 1 ))
-        if [[ "${status}" == "completed" && -n "${objective}" ]] \
+        # A model campaign tracks no best (it fits a surrogate, it has no optimum).
+        # _knit_ax_campaign_mode comes from the _knit_ax_optimize frame; it is unset
+        # when observe runs standalone (a unit test), where best tracking is wanted.
+        if [[ "${_knit_ax_campaign_mode:-optimize}" != "model" \
+            && "${status}" == "completed" && -n "${objective}" ]] \
             && _knit_ax_is_better "${objective}" "${_knit_ax_best_obj}" "${minimize}"; then
             _knit_ax_best_obj="${objective}"
             _knit_ax_best_idx="${tag}"

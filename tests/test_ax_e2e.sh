@@ -237,6 +237,36 @@ _seed_state() {
     [[ "$output" == *"best=—"* ]]
 }
 
+# ---------- a model campaign runs the budget but records no best ----------
+
+@test "optimize on a model campaign runs active learning and records no best" {
+    knit ax prepare --campaign surr --objective score --model \
+        --max-trials 5 -- submit -- train --x @domain
+
+    run knit ax optimize --campaign surr
+    [ "$status" -eq 0 ]
+
+    # The full budget ran and the campaign completed, like an optimize campaign.
+    [ "$(cat "${CAMPAIGNS}/surr/status")" = "completed" ]
+    [ "$(_launch_count)" -eq 5 ]
+    [ "$(jq -r '.trials_done' "${CAMPAIGNS}/surr/result.json")" -eq 5 ]
+
+    # But a model campaign has no optimum: the best is left empty on disk and in
+    # the row, even though the surrogate observed every trial.
+    [ "$(jq -r '.best.objective' "${CAMPAIGNS}/surr/result.json")" = "null" ]
+    local row
+    row="$("${_KNIT_SQLITE_EXE}" "${_KNIT_DATABASE}" \
+        "SELECT (best_id IS NULL OR best_id='')||'|'||(best_objective IS NULL OR best_objective='') \
+         FROM optimizations WHERE id='surr';")"
+    [ "${row}" = "1|1" ]
+
+    # "ax list" renders the absent best as an em-dash.
+    run knit ax list
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"surr"* ]]
+    [[ "$output" == *"best=—"* ]]
+}
+
 # ---------- a driver that cannot resume fails loudly (never re-runs budget) ----
 
 # A driver stand-in that answers every non-shutdown command with an error, used

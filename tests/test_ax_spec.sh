@@ -66,9 +66,10 @@ teardown() {
 
 _spec() {
     # Usage: _spec <objective> <minimize> <seed> <sobol> [downstream tokens...]
+    # Mode defaults to "optimize"; the mode-specific tests call build_spec directly.
     local obj="$1" min="$2" seed="$3" sobol="$4"
     shift 4
-    _knit_ax_build_spec_json "${obj}" "${min}" "${seed}" "${sobol}" "$@"
+    _knit_ax_build_spec_json "${obj}" "${min}" "optimize" "${seed}" "${sobol}" "$@"
 }
 
 # ---------- @domain tokens use the declared domain ----------
@@ -302,6 +303,19 @@ _spec() {
     minimize=$(jq -r  '.objective.minimize' <<<"$spec")
     [ "$obj_name" = "val_loss" ]
     [ "$minimize" = "true" ]
+}
+
+@test "mode is emitted in the spec, defaulting to optimize" {
+    local spec
+    spec=$(_spec "val_loss" "true" "42" "4" train --lr @domain --epochs 20)
+    [ "$(jq -r '.mode' <<<"$spec")" = "optimize" ]
+}
+
+@test "model mode is emitted in the spec" {
+    local spec
+    spec=$(_knit_ax_build_spec_json "val_loss" "false" "model" "" "" \
+        train --lr @domain --epochs 20)
+    [ "$(jq -r '.mode' <<<"$spec")" = "model" ]
 }
 
 @test "seed and sobol_trials appear in spec when set" {
