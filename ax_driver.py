@@ -19,6 +19,7 @@ Search-space JSON schema (produced by Bash; passed verbatim to init)
 ----------------------------------------------------------------------
 {
   "objective":  {"name": "val_loss", "minimize": true},
+  "mode":        "optimize",
   "seed":        1234,
   "sobol_trials": 4,
   "parameters": [
@@ -32,6 +33,11 @@ Only varying parameters (range/choice) appear in the spec. Fixed command
 arguments never reach the driver: knit keeps them in the command template and
 splices them back when it reconstructs a trial, so the driver models only the
 dimensions that vary.
+
+"mode" selects the generation strategy: "optimize" (the default) chases the
+objective; "model" fits a surrogate by active learning (qNIPV) and ignores the
+objective's sense. On resume the strategy is restored from the saved state, so
+the mode marker is only read at init.
 
 The driver targets the modern Ax API (the ``ax.api.Client`` class). The legacy
 ``AxClient`` service API, which this driver used before, is removed in
@@ -53,10 +59,72 @@ def _import_ax() -> Tuple[Any, Any, Any]:
     try:
         from ax.api.client import Client
         from ax.api.configs import RangeParameterConfig, ChoiceParameterConfig
-        return Client, RangeParameterConfig, ChoiceParameterConfig
     except ImportError as exc:
         _emit({"error": f"ax-platform not available: {exc}"})
         sys.exit(1)
+    _register_active_learning_acqf()
+    return Client, RangeParameterConfig, ChoiceParameterConfig
+
+
+def _register_active_learning_acqf() -> None:
+    """Register the active-learning acquisition function with Ax's JSON storage.
+
+    A model campaign uses a custom generation strategy whose BoTorch node sets
+    qNegIntegratedPosteriorVariance as the acquisition class. Ax can only
+    serialize an acquisition class it knows, so save/resume of a model campaign
+    fails unless the class is in the registry. The registry dicts are the
+    sanctioned extension point for this.
+    """
+    from botorch.acquisition.active_learning import qNegIntegratedPosteriorVariance
+    from ax.storage.botorch_modular_registry import (
+        ACQUISITION_FUNCTION_REGISTRY,
+        REVERSE_ACQUISITION_FUNCTION_REGISTRY,
+    )
+    key = qNegIntegratedPosteriorVariance.__name__
+    ACQUISITION_FUNCTION_REGISTRY.setdefault(qNegIntegratedPosteriorVariance, key)
+    REVERSE_ACQUISITION_FUNCTION_REGISTRY.setdefault(key, qNegIntegratedPosteriorVariance)
+
+
+# Default number of Sobol initialization trials for a model campaign when the
+# spec does not set one. BoTorch needs at least a few points to fit a surrogate.
+_DEFAULT_MODEL_SOBOL_TRIALS = 5
+
+
+def _build_model_generation_strategy(seed: Optional[int], sobol_trials: int) -> Any:
+    """Build the active-learning generation strategy: a Sobol initialization node
+    followed by a BoTorch node whose acquisition function is
+    qNegIntegratedPosteriorVariance (qNIPV).
+
+    qNIPV proposes points that reduce the surrogate's posterior variance over the
+    whole space (pure exploration), rather than chasing an optimum. The MC points
+    qNIPV integrates over are drawn by BoTorch's input constructor from the
+    model's transformed-space bounds, so no mc_points are supplied here.
+    """
+    from ax.generation_strategy.generation_strategy import GenerationStrategy
+    from ax.generation_strategy.generation_node import GenerationNode
+    from ax.generation_strategy.generator_spec import GeneratorSpec
+    from ax.generation_strategy.transition_criterion import MinTrials
+    from ax.adapter.registry import Generators
+    from botorch.acquisition.active_learning import qNegIntegratedPosteriorVariance
+
+    sobol = GenerationNode(
+        name="Sobol",
+        generator_specs=[GeneratorSpec(
+            generator_enum=Generators.SOBOL,
+            generator_kwargs={"seed": seed},
+        )],
+        transition_criteria=[MinTrials(
+            threshold=sobol_trials, transition_to="ActiveLearning",
+        )],
+    )
+    active = GenerationNode(
+        name="ActiveLearning",
+        generator_specs=[GeneratorSpec(
+            generator_enum=Generators.BOTORCH_MODULAR,
+            generator_kwargs={"botorch_acqf_class": qNegIntegratedPosteriorVariance},
+        )],
+    )
+    return GenerationStrategy(name="active-learning", nodes=[sobol, active])
 
 
 def _emit(msg: dict) -> None:
@@ -209,21 +277,34 @@ class AxDriver:
         seed = spec.get("seed")
         sobol_trials = spec.get("sobol_trials")
 
+        mode = spec.get("mode", "optimize")
+
         self._client = self._Client()
         self._client.configure_experiment(
             name="knit_ax",
             parameters=self._parameters(spec.get("parameters", [])),
         )
-        # The objective string encodes the sense: a leading "-" minimizes.
+        # The objective is declared in both modes. In optimize mode its sense
+        # drives the search (a leading "-" minimizes); in model mode the sense is
+        # ignored (qNIPV explores the whole space), but the metric is still the
+        # one the surrogate models.
         self._client.configure_optimization(
             objective=f"-{self._obj_name}" if self._minimize else self._obj_name
         )
-        gs_kwargs: dict = {}
-        if seed is not None:
-            gs_kwargs["initialization_random_seed"] = int(seed)
-        if sobol_trials is not None:
-            gs_kwargs["initialization_budget"] = int(sobol_trials)
-        self._client.configure_generation_strategy(**gs_kwargs)
+        if mode == "model":
+            n_sobol = int(sobol_trials) if sobol_trials is not None \
+                else _DEFAULT_MODEL_SOBOL_TRIALS
+            gs = _build_model_generation_strategy(
+                int(seed) if seed is not None else None, n_sobol,
+            )
+            self._client.set_generation_strategy(generation_strategy=gs)
+        else:
+            gs_kwargs: dict = {}
+            if seed is not None:
+                gs_kwargs["initialization_random_seed"] = int(seed)
+            if sobol_trials is not None:
+                gs_kwargs["initialization_budget"] = int(sobol_trials)
+            self._client.configure_generation_strategy(**gs_kwargs)
 
         self._observations = {}
         self._trial_params = {}
