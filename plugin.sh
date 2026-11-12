@@ -135,23 +135,22 @@ _knit_ax_driver_setup() { :; }
 knit_register_setup "_ax-driver" _knit_ax_driver_setup \
     "Internal: Ax BO environment (knit-ax private, not user-facing)."
 _knit_is_builtin
-# ax_driver.py drives Ax through the AxClient service API. AxClient is deprecated
-# and is REMOVED in ax-platform 1.4.0, so the dependency is capped at <1.4 to keep
-# this released driver working; the validated version is ax 1.3.x. The floor
-# >=0.4.0 is the API this driver targets.
-#
-# TODO(knit-ax): migrate ax_driver.py off the deprecated AxClient onto the modern
-# Ax Client API (the `ax.api` `Client` class) so the <1.4 ceiling can be lifted.
-# Until that migration lands, do NOT relax the ax-platform upper bound.
+# ax_driver.py drives Ax through the modern ax.api.Client API
+# (configure_experiment / configure_optimization / get_next_trials /
+# complete_trial / predict). The legacy AxClient service API, which this driver
+# used before, is removed in ax-platform 1.4.0; the Client API replaces it. The
+# floor is >=1.3, the first line that ships the stable ax.api.Client (the
+# validated version is ax 1.3.x). There is no upper bound: the uv lock freezes
+# the resolved version per experiment, so a new ax release cannot change an
+# existing campaign.
 #
 # A full manifest (rather than the knit_with_uv_specs sugar) is used to pin
 # requires-python to the 3.12 line.
 #
 # The requires-python window is bounded on BOTH sides on purpose. The floor keeps it off Python
-# the dependencies reject (every ax-platform that satisfies the version floor
-# needs >=3.10, the current line needs >=3.11), so a host 3.9 — common on login
-# nodes and CI images — cannot resolve it; pinning here makes uv fetch a managed
-# interpreter instead. The ceiling keeps it off Python too NEW for the native
+# the dependencies reject (ax-platform >=1.3 needs Python >=3.11), so a host 3.9
+# or 3.10 — common on login nodes and CI images — cannot resolve it; pinning here
+# makes uv fetch a managed interpreter instead. The ceiling keeps it off Python too NEW for the native
 # wheels: with only an open floor, uv (which builds on managed interpreters, see
 # knit-uv) picks the newest managed CPython, and PyTorch — pulled in by
 # ax-platform via botorch — publishes no wheels for a just-released Python
@@ -173,7 +172,7 @@ name = "knit-ax-driver"
 version = "1.0.0"
 requires-python = ">=3.12,<3.13"
 dependencies = [
-    "ax-platform>=0.4.0,<1.4",
+    "ax-platform>=1.3",
     "numpy",
     "torch",
 ]
