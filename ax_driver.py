@@ -13,6 +13,7 @@ ask      {"cmd":"ask",    "n":<int>}
 tell     {"cmd":"tell",   "index":<int>, "objective":<float>, "status":"ok"|"penalized"|"failed"}
 best     {"cmd":"best"}
 predict  {"cmd":"predict","points":[{<axis>:<value>, ...}, ...]}
+diagnostics {"cmd":"diagnostics"}
 save     {"cmd":"save",   "path":<path>}
 shutdown {"cmd":"shutdown"}
 
@@ -401,6 +402,50 @@ class AxDriver:
             })
         self._send({"predictions": out})
 
+    def cmd_diagnostics(self, _req: dict) -> None:
+        # Surrogate fit quality by leave-one-out cross-validation. Every
+        # diagnostics call resumes from disk in a fresh process, so fit the
+        # adapter first (a bare load does not build it), then cross-validate.
+        # R^2 and RMSE are computed from the held-out fold predictions of the
+        # objective metric rather than read from a named diagnostic, so the
+        # numbers are the familiar coefficient of determination and root mean
+        # squared error.
+        from ax.adapter.cross_validation import cross_validate
+        try:
+            gs = self._client._generation_strategy
+            gs.fit(experiment=self._client._experiment)
+            adapter = gs.adapter
+            if adapter is None:
+                raise RuntimeError("the surrogate model is not fitted")
+            cv_results = cross_validate(adapter)
+        except Exception as exc:
+            raise RuntimeError(
+                f"cross-validation is not possible yet ({exc}); "
+                "run more trials with 'ax optimize'"
+            ) from exc
+
+        observed: List[float] = []
+        predicted: List[float] = []
+        for cv in cv_results:
+            obs = cv.observed.data.means_dict.get(self._obj_name)
+            pred = cv.predicted.means_dict.get(self._obj_name)
+            if obs is None or pred is None:
+                continue
+            observed.append(float(obs))
+            predicted.append(float(pred))
+
+        n = len(observed)
+        if n == 0:
+            raise RuntimeError("cross-validation produced no comparable points")
+        mean_obs = sum(observed) / n
+        ss_res = sum((o - p) ** 2 for o, p in zip(observed, predicted))
+        ss_tot = sum((o - mean_obs) ** 2 for o in observed)
+        # R^2 is undefined when every observation is identical (no variance to
+        # explain); report null there rather than dividing by zero.
+        r2: Optional[float] = (1.0 - ss_res / ss_tot) if ss_tot > 0 else None
+        rmse = (ss_res / n) ** 0.5
+        self._send({"diagnostics": {"n": n, "r2": r2, "rmse": rmse}})
+
     def cmd_save(self, req: dict) -> None:
         path = req["path"]
         Path(path).parent.mkdir(parents=True, exist_ok=True)
@@ -423,6 +468,7 @@ class AxDriver:
             "tell": self.cmd_tell,
             "best": self.cmd_best,
             "predict": self.cmd_predict,
+            "diagnostics": self.cmd_diagnostics,
             "save": self.cmd_save,
             "shutdown": self.cmd_shutdown,
         }

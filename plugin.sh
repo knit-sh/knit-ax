@@ -365,6 +365,9 @@ _knit_ax_discover() {
     knit_without_provenance
     knit_with_required "campaign:string" \
         "The campaign to show."
+    knit_with_flag "diagnostics" \
+        "Also compute and report surrogate fit quality (cross-validated R^2 / RMSE). Refits the model, so it is opt-in." \
+        --no-record
     knit_done
 
     # --- ax predict: query a campaign's fitted surrogate at a point ----------
@@ -957,14 +960,19 @@ _knit_ax_list() {
 # @fn _knit_ax_show()
 #
 # Entry point for "ax show". Prints one campaign's detail — the stored command,
-# status, objective/sense, trials-done/budget, seed, current best, and opt-id —
-# read from its campaign directory (no Ax process, no database).
+# status, objective/sense, trials-done/budget, seed, and opt-id — read from its
+# campaign directory (no Ax process, no database). An optimize campaign also shows
+# its current best; a model campaign has no optimum, so it shows the
+# command-qualified axis names instead (the command shape "ax predict" expects).
+# With --diagnostics it additionally starts the Ax driver to report the
+# surrogate's cross-validated fit quality (R^2 / RMSE).
 #
 # @param[in] ... All arguments as expanded by the CLI framework.
 # ------------------------------------------------------------------------------
 _knit_ax_show() {
-    local campaign
+    local campaign diagnostics_flag
     campaign=$(knit_get_parameter "campaign" "$@")
+    diagnostics_flag=$(knit_get_parameter "diagnostics" "$@") || diagnostics_flag="false"
 
     local dir
     _knit_ax_campaign_dir dir "${campaign}"
@@ -976,11 +984,15 @@ _knit_ax_show() {
     def="$(<"${deffile}")"
     local status="unknown"
     [[ -f "${dir}/status" ]] && status="$(<"${dir}/status")"
-    local objective sense max_trials seed opt_id
-    IFS=$'\t' read -r objective sense max_trials seed opt_id \
-        < <(knit_jq -r '[ .objective, .sense, (.max_trials|tostring),
+    local objective sense minimize mode max_trials seed sobol opt_id
+    # Join on SOH, not a tab: "read" with a whitespace IFS collapses consecutive
+    # tabs, so the empty seed/sobol fields would shift opt_id left into seed.
+    IFS=$'\001' read -r objective sense minimize mode max_trials seed sobol opt_id \
+        < <(knit_jq -r '[ .objective, .sense, (.minimize|tostring),
+                          (.mode // "optimize"), (.max_trials|tostring),
                           ((.seed // "")|tostring),
-                          .opt_id ] | @tsv' <<<"${def}")
+                          ((.sobol_trials // "")|tostring),
+                          .opt_id ] | join("\u0001")' <<<"${def}")
     local -a ds
     mapfile -t ds < <(knit_jq -r '.downstream[]' <<<"${def}")
     local done_n best
@@ -991,10 +1003,107 @@ _knit_ax_show() {
     printf 'objective:  %s (%s)\n' "${objective}" "${sense}"
     printf 'trials:     %s/%s\n' "${done_n:-0}" "${max_trials}"
     [[ -n "${seed}" ]] && printf 'seed:       %s\n' "${seed}"
-    printf 'best:       %s\n' "${best:-—}"
+    if [[ "${mode}" == "model" ]]; then
+        # A model campaign has no optimum; show the varying axes instead, so the
+        # user knows the command shape "ax predict" expects.
+        local axes_line
+        _knit_ax_axis_names axes_line "${objective}" "${minimize}" "${mode}" \
+            "${seed}" "${sobol}" "${ds[@]}"
+        [[ -n "${axes_line}" ]] && printf 'axes:       %s\n' "${axes_line}"
+    else
+        printf 'best:       %s\n' "${best:-—}"
+    fi
     printf 'opt-id:     %s\n' "${opt_id}"
     printf 'command:    %s\n' "${ds[*]}"
+
+    [[ "${diagnostics_flag}" == "true" ]] && _knit_ax_show_diagnostics "${campaign}" "${dir}"
     return 0
+}
+
+# ------------------------------------------------------------------------------
+# @fn _knit_ax_axis_names()
+#
+# Store the comma-separated command-qualified axis names of a campaign in the
+# caller-named variable (e.g. "submit.nodes, train.x"). The names come from the
+# Ax search-space spec built from the downstream, the authoritative axis set.
+# Best-effort: an empty string is returned when the spec cannot be built (e.g. the
+# downstream command is not registered in this process), so "ax show" still prints
+# the rest of the campaign detail.
+#
+# @param[out] 1 Name of the variable to receive the axis-name list.
+# @param[in] 2 The objective ("[table:]<output>").
+# @param[in] 3 "true" to minimize, "false" to maximize (irrelevant to the names).
+# @param[in] 4 Campaign mode ("optimize"/"model").
+# @param[in] 5 RNG seed (may be empty).
+# @param[in] 6 Sobol initialization count (may be empty).
+# @param[in] ... The downstream tokens.
+# ------------------------------------------------------------------------------
+_knit_ax_axis_names() {
+    local -n __knit_ret=$1
+    local objective="$2" minimize="$3" mode="$4" seed="$5" sobol="$6"
+    shift 6
+    __knit_ret=""
+    local spec
+    spec=$(_knit_ax_build_spec_json "${objective}" "${minimize}" "${mode}" \
+        "${seed}" "${sobol}" "$@" 2>/dev/null) || return 0
+    __knit_ret=$(knit_jq -r '[ .parameters[].name ] | join(", ")' <<<"${spec}")
+}
+
+# ------------------------------------------------------------------------------
+# @fn _knit_ax_show_diagnostics()
+#
+# Report a campaign's surrogate fit quality for "ax show --diagnostics". Resumes
+# the Ax driver from the campaign's persisted state and asks it to cross-validate
+# the fitted model, then prints the cross-validated coefficient of determination
+# (R^2) and root mean squared error (RMSE). Works on a model or an optimize
+# campaign (both carry a fitted surrogate); it needs a run campaign, so it fatals
+# when no state.json exists yet.
+#
+# @param[in] campaign The campaign name.
+# @param[in] dir The campaign directory.
+# ------------------------------------------------------------------------------
+_knit_ax_show_diagnostics() {
+    local campaign="$1" dir="$2"
+    local state_path="${dir}/state.json"
+    [[ -f "${state_path}" ]] || knit_fatal "ax show: campaign '%s' has no trials yet; --diagnostics needs a fitted model (run 'ax optimize --campaign %s' first)." \
+        "${campaign}" "${campaign}"
+
+    local driver_prefix
+    _knit_ax_ensure_driver driver_prefix \
+        || knit_fatal "ax show: could not build the _ax-driver environment."
+    local driver_log="${dir}/ax-driver.log"
+    _knit_ax_start_driver "${driver_prefix}" "${driver_log}"
+    trap '_knit_ax_shutdown' EXIT
+
+    local resp resume_req
+    # shellcheck disable=SC2016 # $p is a jq variable, not shell
+    resume_req=$(knit_jq -cn --arg p "${state_path}" '{cmd:"resume",path:$p,state_path:$p}')
+    _knit_ax_rpc resp "${resume_req}"
+    if [[ "$(knit_jq -r '.status // "error"' <<<"${resp}")" != "ok" ]]; then
+        knit_fatal "ax show: the Ax driver failed to load campaign '%s': %s (see %s)." \
+            "${campaign}" "$(knit_jq -r '.error // "unknown error"' <<<"${resp}")" "${driver_log}"
+    fi
+    _knit_ax_rpc resp '{"cmd":"diagnostics"}'
+    _knit_ax_shutdown
+    trap - EXIT
+
+    if knit_jq -e 'has("error")' >/dev/null 2>&1 <<<"${resp}"; then
+        knit_fatal "ax show: could not compute diagnostics for campaign '%s': %s." \
+            "${campaign}" "$(knit_jq -r '.error' <<<"${resp}")"
+    fi
+
+    local n r2 rmse r2_g rmse_g
+    IFS=$'\t' read -r n r2 rmse < <(knit_jq -r \
+        '.diagnostics | [ (.n|tostring), ((.r2 // "")|tostring), (.rmse|tostring) ] | @tsv' <<<"${resp}")
+    if [[ -z "${r2}" ]]; then
+        r2_g="n/a (objective is constant over the trials)"
+    else
+        r2_g=$(awk -v v="${r2}" 'BEGIN{printf "%.4g", v}')
+    fi
+    rmse_g=$(awk -v v="${rmse}" 'BEGIN{printf "%.4g", v}')
+    printf 'diagnostics:\n'
+    printf '  cross-val R^2:  %s  (%s folds)\n' "${r2_g}" "${n}"
+    printf '  cross-val RMSE: %s\n' "${rmse_g}"
 }
 
 # ------------------------------------------------------------------------------

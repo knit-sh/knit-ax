@@ -573,6 +573,31 @@ class TestAxPredict(unittest.TestCase):
             resp = dp.send({"cmd": "predict", "points": [{"x": 99.0}]})
         self.assertIn("error", resp, resp)
 
+    def _assert_diagnostics(self, resp: dict) -> None:
+        self.assertIn("diagnostics", resp, resp)
+        diag = resp["diagnostics"]
+        self.assertGreater(diag["n"], 0, resp)
+        self.assertIsInstance(diag["rmse"], float)
+        self.assertGreaterEqual(diag["rmse"], 0.0)
+        # r2 may be null only when the objective is constant; it is not here.
+        self.assertIsInstance(diag["r2"], float)
+
+    def test_diagnostics_model_resume(self) -> None:
+        state = os.path.join(self.tmpdir, "diag_model.json")
+        self._run_and_save(SPEC_MODEL, state, n=8)
+        with DriverProcess() as dp:
+            dp.send({"cmd": "resume", "path": state, "state_path": state})
+            resp = dp.send({"cmd": "diagnostics"})
+        self._assert_diagnostics(resp)
+
+    def test_diagnostics_optimize_resume(self) -> None:
+        state = os.path.join(self.tmpdir, "diag_opt.json")
+        self._run_and_save(SPEC_1D, state, n=8)
+        with DriverProcess() as dp:
+            dp.send({"cmd": "resume", "path": state, "state_path": state})
+            resp = dp.send({"cmd": "diagnostics"})
+        self._assert_diagnostics(resp)
+
 
 if __name__ == "__main__":
     unittest.main()

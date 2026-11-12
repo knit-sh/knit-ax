@@ -155,6 +155,12 @@ class FakeDriver:
             out.append({name: {"mean": total, "sem": 2.0}})
         return {"predictions": out}
 
+    def diagnostics(self, _req: dict) -> dict:
+        """Deterministic stand-in for cross-validation diagnostics: a fixed fold
+        count, R^2, and RMSE, so a test can assert exact numbers without fitting
+        a real model."""
+        return {"diagnostics": {"n": 4, "r2": 0.9, "rmse": 1.5}}
+
 
 def main() -> int:
     driver = FakeDriver()
@@ -178,6 +184,8 @@ def main() -> int:
             resp = driver.best(req)
         elif cmd == "predict":
             resp = driver.predict(req)
+        elif cmd == "diagnostics":
+            resp = driver.diagnostics(req)
         else:
             resp = {"error": f"unknown command: {cmd}"}
         sys.stdout.write(json.dumps(resp) + "\n")
