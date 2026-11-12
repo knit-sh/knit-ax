@@ -24,10 +24,18 @@ Search-space JSON schema (produced by Bash; passed verbatim to init)
   "parameters": [
     {"name":"lr",    "ax":"range",  "value_type":"float", "bounds":[1e-5,1.0], "log_scale":true},
     {"name":"batch", "ax":"choice", "value_type":"int",   "values":[16,32,64], "ordered":true},
-    {"name":"opt",   "ax":"choice", "value_type":"str",   "values":["sgd","adam"], "ordered":false},
-    {"name":"epoch", "ax":"fixed",  "value":20}
+    {"name":"opt",   "ax":"choice", "value_type":"str",   "values":["sgd","adam"], "ordered":false}
   ]
 }
+
+Only varying parameters (range/choice) appear in the spec. Fixed command
+arguments never reach the driver: knit keeps them in the command template and
+splices them back when it reconstructs a trial, so the driver models only the
+dimensions that vary.
+
+The driver targets the modern Ax API (the ``ax.api.Client`` class). The legacy
+``AxClient`` service API, which this driver used before, is removed in
+ax-platform 1.4.0.
 """
 from __future__ import annotations
 
@@ -41,11 +49,11 @@ from typing import Any, Dict, List, Optional, Tuple
 # Ax import — fail fast with a JSON error if ax-platform is not installed
 # ---------------------------------------------------------------------------
 
-def _import_ax() -> Tuple[Any, Any]:
+def _import_ax() -> Tuple[Any, Any, Any]:
     try:
-        from ax.service.ax_client import AxClient
-        from ax.service.utils.instantiation import ObjectiveProperties
-        return AxClient, ObjectiveProperties
+        from ax.api.client import Client
+        from ax.api.configs import RangeParameterConfig, ChoiceParameterConfig
+        return Client, RangeParameterConfig, ChoiceParameterConfig
     except ImportError as exc:
         _emit({"error": f"ax-platform not available: {exc}"})
         sys.exit(1)
@@ -56,38 +64,14 @@ def _emit(msg: dict) -> None:
     sys.stdout.flush()
 
 
-# ---------------------------------------------------------------------------
-# Parameter conversion
-# ---------------------------------------------------------------------------
-
-def _ax_parameters(spec_params: List[dict]) -> List[dict]:
-    """Convert knit search-space parameter descriptors to Ax parameter dicts."""
-    out: List[dict] = []
-    for p in spec_params:
-        kind = p["ax"]
-        if kind == "range":
-            out.append({
-                "name": p["name"],
-                "type": "range",
-                "bounds": p["bounds"],
-                "value_type": p["value_type"],
-                "log_scale": bool(p.get("log_scale", False)),
-            })
-        elif kind == "choice":
-            out.append({
-                "name": p["name"],
-                "type": "choice",
-                "values": p["values"],
-                "value_type": p["value_type"],
-                "is_ordered": bool(p.get("ordered", False)),
-            })
-        elif kind == "fixed":
-            out.append({
-                "name": p["name"],
-                "type": "fixed",
-                "value": p["value"],
-            })
-    return out
+# These statuses count against the trial budget and mark a trial as observed.
+_TERMINAL_STATUSES = frozenset({"COMPLETED", "FAILED"})
+# These statuses mark a trial still in flight: a resumed campaign abandons them.
+_INFLIGHT_STATUSES = frozenset({"RUNNING", "CANDIDATE", "STAGED"})
+# Columns in Client.summarize() that are not search parameters.
+_NON_PARAM_COLUMNS = frozenset(
+    {"trial_index", "arm_name", "trial_status", "generation_node"}
+)
 
 
 # ---------------------------------------------------------------------------
@@ -96,7 +80,7 @@ def _ax_parameters(spec_params: List[dict]) -> List[dict]:
 
 class AxDriver:
     def __init__(self) -> None:
-        self._AxClient, self._ObjectiveProperties = _import_ax()
+        self._Client, self._RangeCfg, self._ChoiceCfg = _import_ax()
         self._client: Any = None
         self._obj_name: str = ""
         self._minimize: bool = True
@@ -104,6 +88,9 @@ class AxDriver:
         # Completed observations tracked locally so best() does not rely on
         # version-specific Ax model introspection APIs.
         self._observations: Dict[int, Tuple[dict, float]] = {}
+        # Parameters of the trials this process asked, so tell() can record an
+        # observation without reading them back out of Ax.
+        self._trial_params: Dict[int, dict] = {}
 
     # ------------------------------------------------------------------
     # helpers
@@ -111,6 +98,48 @@ class AxDriver:
 
     def _send(self, msg: dict) -> None:
         _emit(msg)
+
+    def _parameters(self, spec_params: List[dict]) -> List[Any]:
+        """Convert knit search-space parameter descriptors to Ax parameter
+        config objects. Only range and choice parameters vary, so only those
+        two kinds are converted; any other kind is skipped."""
+        out: List[Any] = []
+        for p in spec_params:
+            kind = p["ax"]
+            if kind == "range":
+                vtype = p["value_type"]
+                ptype = "int" if vtype == "int" else "float"
+                scaling = "log" if bool(p.get("log_scale", False)) else None
+                out.append(self._RangeCfg(
+                    name=p["name"],
+                    bounds=tuple(p["bounds"]),
+                    parameter_type=ptype,
+                    scaling=scaling,
+                ))
+            elif kind == "choice":
+                vtype = p["value_type"]
+                values = p["values"]
+                if vtype == "int":
+                    values = [int(v) for v in values]
+                elif vtype == "float":
+                    values = [float(v) for v in values]
+                else:
+                    values = [str(v) for v in values]
+                out.append(self._ChoiceCfg(
+                    name=p["name"],
+                    values=values,
+                    parameter_type=vtype,
+                    is_ordered=bool(p.get("ordered", False)),
+                ))
+        return out
+
+    def _summary_rows(self) -> List[dict]:
+        """Return Client.summarize() as a list of plain dict rows (empty on any
+        error, e.g. before an experiment exists)."""
+        try:
+            return self._client.summarize().to_dict(orient="records")
+        except Exception:
+            return []
 
     def _n_trials(self) -> int:
         """Trials that have consumed budget: the terminal evaluated ones
@@ -123,15 +152,11 @@ class AxDriver:
         Counting them would silently shrink the delivered budget and lose those
         evaluations.
         """
-        try:
-            n = 0
-            for trial in self._client.experiment.trials.values():
-                status = trial.status
-                if status.is_completed or status.is_failed:
-                    n += 1
-            return n
-        except Exception:
-            return 0
+        n = 0
+        for row in self._summary_rows():
+            if str(row.get("trial_status", "")).upper() in _TERMINAL_STATUSES:
+                n += 1
+        return n
 
     def _abandon_stale_trials(self) -> int:
         """Abandon any non-terminal trial (RUNNING/CANDIDATE) left behind by a
@@ -141,41 +166,35 @@ class AxDriver:
         skipped.
         """
         n = 0
-        try:
-            for trial in self._client.experiment.trials.values():
-                status = trial.status
-                if status.is_completed or status.is_failed or status.is_abandoned:
-                    continue
-                try:
-                    trial.mark_abandoned(reason="resumed after interruption")
-                    n += 1
-                except Exception:
-                    pass
-        except Exception:
-            pass
+        for row in self._summary_rows():
+            if str(row.get("trial_status", "")).upper() not in _INFLIGHT_STATUSES:
+                continue
+            try:
+                self._client.mark_trial_abandoned(trial_index=int(row["trial_index"]))
+                n += 1
+            except Exception:
+                pass
         return n
 
     def _rebuild_observations(self) -> None:
         """Repopulate _observations from a freshly loaded experiment."""
         self._observations = {}
-        try:
-            data = self._client.experiment.fetch_data()
-            df = data.df
-            obj_rows = df[df["metric_name"] == self._obj_name]
-            for _, row in obj_rows.iterrows():
-                t_idx = int(row["trial_index"])
-                trial = self._client.experiment.trials.get(t_idx)
-                if trial is None:
-                    continue
-                arm = getattr(trial, "arm", None)
-                if arm is None:
-                    continue
-                self._observations[t_idx] = (
-                    dict(arm.parameters),
-                    float(row["mean"]),
-                )
-        except Exception:
-            pass
+        non_params = _NON_PARAM_COLUMNS | {self._obj_name}
+        for row in self._summary_rows():
+            if str(row.get("trial_status", "")).upper() != "COMPLETED":
+                continue
+            obj = row.get(self._obj_name)
+            if obj is None:
+                continue
+            try:
+                obj_val = float(obj)
+            except (TypeError, ValueError):
+                continue
+            # A NaN objective (never fetched) is not an observation.
+            if obj_val != obj_val:  # noqa: PLR0124 — NaN check
+                continue
+            params = {k: v for k, v in row.items() if k not in non_params}
+            self._observations[int(row["trial_index"])] = (params, obj_val)
 
     # ------------------------------------------------------------------
     # commands
@@ -190,55 +209,46 @@ class AxDriver:
         seed = spec.get("seed")
         sobol_trials = spec.get("sobol_trials")
 
-        self._client = self._AxClient(
-            random_seed=seed,
-            verbose_logging=False,
-        )
-        gen_kwargs: dict = {}
-        if sobol_trials is not None:
-            gen_kwargs["num_initialization_trials"] = int(sobol_trials)
-
-        self._client.create_experiment(
+        self._client = self._Client()
+        self._client.configure_experiment(
             name="knit_ax",
-            parameters=_ax_parameters(spec.get("parameters", [])),
-            objectives={
-                self._obj_name: self._ObjectiveProperties(minimize=self._minimize)
-            },
-            choose_generation_strategy_kwargs=gen_kwargs if gen_kwargs else None,
+            parameters=self._parameters(spec.get("parameters", [])),
         )
+        # The objective string encodes the sense: a leading "-" minimizes.
+        self._client.configure_optimization(
+            objective=f"-{self._obj_name}" if self._minimize else self._obj_name
+        )
+        gs_kwargs: dict = {}
+        if seed is not None:
+            gs_kwargs["initialization_random_seed"] = int(seed)
+        if sobol_trials is not None:
+            gs_kwargs["initialization_budget"] = int(sobol_trials)
+        self._client.configure_generation_strategy(**gs_kwargs)
+
         self._observations = {}
+        self._trial_params = {}
         self._send({"status": "ok", "n_trials": 0})
 
     def cmd_resume(self, req: dict) -> None:
         path = req["path"]
         self._state_path = req.get("state_path", path)
-        self._client = self._AxClient.load_from_json_file(path)
+        self._client = self._Client.load_from_json_file(path)
         # Recover the objective name and sense from the persisted experiment.
-        # Use AxClient.objective_name (stable public API) for the name:
-        # opt_cfg.objective.metric does not exist in every Ax version (1.x's
-        # Objective exposes metric_names, not metric), so reaching for .metric
-        # raised "'Objective' object has no attribute 'metric'" and broke resume.
-        self._obj_name = self._client.objective_name
-        opt_cfg = self._client.experiment.optimization_config
-        if opt_cfg is not None:
-            self._minimize = bool(opt_cfg.objective.minimize)
+        obj = self._client._experiment.optimization_config.objective
+        self._obj_name = obj.metric_names[0]
+        self._minimize = bool(obj.minimize)
         self._rebuild_observations()
         self._abandon_stale_trials()
         self._send({"status": "ok", "n_trials": self._n_trials()})
 
     def cmd_ask(self, req: dict) -> None:
         n = int(req.get("n", 1))
-        # get_next_trials returns (Dict[index, params], optimization_complete)
-        # in some versions, or just Dict[index, params] in others.
-        raw = self._client.get_next_trials(max_trials=n)
-        if isinstance(raw, tuple):
-            trials_dict, _ = raw
-        else:
-            trials_dict = raw
-        trials = [
-            {"index": idx, "params": params}
-            for idx, params in trials_dict.items()
-        ]
+        trials_dict = self._client.get_next_trials(max_trials=n)
+        trials = []
+        for idx, params in trials_dict.items():
+            params = dict(params)
+            self._trial_params[int(idx)] = params
+            trials.append({"index": int(idx), "params": params})
         self._send({"trials": trials})
 
     def cmd_tell(self, req: dict) -> None:
@@ -250,15 +260,9 @@ class AxDriver:
                 trial_index=idx,
                 raw_data={self._obj_name: obj_val},
             )
-            trial = self._client.experiment.trials.get(idx)
-            params: dict = {}
-            if trial is not None:
-                arm = getattr(trial, "arm", None)
-                if arm is not None:
-                    params = dict(arm.parameters)
-            self._observations[idx] = (params, obj_val)
+            self._observations[idx] = (self._trial_params.get(idx, {}), obj_val)
         else:
-            self._client.log_trial_failure(trial_index=idx)
+            self._client.mark_trial_failed(trial_index=idx)
         # Persist after every tell so a killed coprocess can be resumed.
         if self._state_path:
             Path(self._state_path).parent.mkdir(parents=True, exist_ok=True)
