@@ -139,6 +139,28 @@ class FakeDriver:
             "n_trials": n_trials,
         }
 
+    def predict(self, req: dict) -> dict:
+        """Deterministic stand-in for the surrogate: the predicted mean is the
+        sum of the point's numeric coordinates and the SEM is a constant, so a
+        test can assert an exact value without fitting a real model."""
+        name = self.spec.get("objective", {}).get("name", "objective")
+        out = []
+        for point in req.get("points", []):
+            total = 0.0
+            for value in point.values():
+                try:
+                    total += float(value)
+                except (TypeError, ValueError):
+                    pass
+            out.append({name: {"mean": total, "sem": 2.0}})
+        return {"predictions": out}
+
+    def diagnostics(self, _req: dict) -> dict:
+        """Deterministic stand-in for cross-validation diagnostics: a fixed fold
+        count, R^2, and RMSE, so a test can assert exact numbers without fitting
+        a real model."""
+        return {"diagnostics": {"n": 4, "r2": 0.9, "rmse": 1.5}}
+
 
 def main() -> int:
     driver = FakeDriver()
@@ -160,6 +182,10 @@ def main() -> int:
             resp = driver.tell(req)
         elif cmd == "best":
             resp = driver.best(req)
+        elif cmd == "predict":
+            resp = driver.predict(req)
+        elif cmd == "diagnostics":
+            resp = driver.diagnostics(req)
         else:
             resp = {"error": f"unknown command: {cmd}"}
         sys.stdout.write(json.dumps(resp) + "\n")

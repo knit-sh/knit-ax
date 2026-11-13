@@ -69,6 +69,50 @@ _prepare_demo() {
     [ "$(jq -r '.sense' <<<"$(cat "${CAMPAIGNS}/up/definition.json")")" = "maximize" ]
 }
 
+@test "prepare records mode=optimize in the definition by default" {
+    _prepare_demo
+    [ "$(jq -r '.mode' <<<"$(cat "${CAMPAIGNS}/demo/definition.json")")" = "optimize" ]
+}
+
+@test "prepare --model sets sense and mode to model in the definition" {
+    knit ax prepare --campaign surr --objective val_loss --model --max-trials 6 \
+        -- submit -- train --lr @domain
+    local def
+    def="$(cat "${CAMPAIGNS}/surr/definition.json")"
+    [ "$(jq -r '.sense' <<<"$def")" = "model" ]
+    [ "$(jq -r '.mode'  <<<"$def")" = "model" ]
+}
+
+@test "prepare --model records sense=model in the optimizations row" {
+    knit ax prepare --campaign surr --objective val_loss --model --max-trials 6 \
+        -- submit -- train --lr @domain
+    [ "$("${_KNIT_SQLITE_EXE}" "${_KNIT_DATABASE}" \
+        "SELECT sense FROM optimizations WHERE id='surr';")" = "model" ]
+}
+
+@test "prepare --model rejects --minimize" {
+    run knit ax prepare --campaign bad --objective val_loss --model --minimize \
+        --max-trials 6 -- submit -- train --lr @domain
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"model"* ]]
+    [[ "$output" == *"minimize"* ]]
+}
+
+@test "prepare --model rejects --maximize" {
+    run knit ax prepare --campaign bad --objective val_loss --model --maximize \
+        --max-trials 6 -- submit -- train --lr @domain
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"model"* ]]
+    [[ "$output" == *"maximize"* ]]
+}
+
+@test "prepare --model still requires --objective" {
+    run knit ax prepare --campaign bad --model --max-trials 6 \
+        -- submit -- train --lr @domain
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"objective"* ]]
+}
+
 @test "prepare records the optimizations row under the campaign id" {
     _prepare_demo
     local row

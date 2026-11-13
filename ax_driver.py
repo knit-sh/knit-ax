@@ -12,6 +12,8 @@ resume   {"cmd":"resume", "path":<state.json>,         "state_path":<path>}
 ask      {"cmd":"ask",    "n":<int>}
 tell     {"cmd":"tell",   "index":<int>, "objective":<float>, "status":"ok"|"penalized"|"failed"}
 best     {"cmd":"best"}
+predict  {"cmd":"predict","points":[{<axis>:<value>, ...}, ...]}
+diagnostics {"cmd":"diagnostics"}
 save     {"cmd":"save",   "path":<path>}
 shutdown {"cmd":"shutdown"}
 
@@ -19,6 +21,7 @@ Search-space JSON schema (produced by Bash; passed verbatim to init)
 ----------------------------------------------------------------------
 {
   "objective":  {"name": "val_loss", "minimize": true},
+  "mode":        "optimize",
   "seed":        1234,
   "sobol_trials": 4,
   "parameters": [
@@ -32,6 +35,11 @@ Only varying parameters (range/choice) appear in the spec. Fixed command
 arguments never reach the driver: knit keeps them in the command template and
 splices them back when it reconstructs a trial, so the driver models only the
 dimensions that vary.
+
+"mode" selects the generation strategy: "optimize" (the default) chases the
+objective; "model" fits a surrogate by active learning (qNIPV) and ignores the
+objective's sense. On resume the strategy is restored from the saved state, so
+the mode marker is only read at init.
 
 The driver targets the modern Ax API (the ``ax.api.Client`` class). The legacy
 ``AxClient`` service API, which this driver used before, is removed in
@@ -53,10 +61,72 @@ def _import_ax() -> Tuple[Any, Any, Any]:
     try:
         from ax.api.client import Client
         from ax.api.configs import RangeParameterConfig, ChoiceParameterConfig
-        return Client, RangeParameterConfig, ChoiceParameterConfig
     except ImportError as exc:
         _emit({"error": f"ax-platform not available: {exc}"})
         sys.exit(1)
+    _register_active_learning_acqf()
+    return Client, RangeParameterConfig, ChoiceParameterConfig
+
+
+def _register_active_learning_acqf() -> None:
+    """Register the active-learning acquisition function with Ax's JSON storage.
+
+    A model campaign uses a custom generation strategy whose BoTorch node sets
+    qNegIntegratedPosteriorVariance as the acquisition class. Ax can only
+    serialize an acquisition class it knows, so save/resume of a model campaign
+    fails unless the class is in the registry. The registry dicts are the
+    sanctioned extension point for this.
+    """
+    from botorch.acquisition.active_learning import qNegIntegratedPosteriorVariance
+    from ax.storage.botorch_modular_registry import (
+        ACQUISITION_FUNCTION_REGISTRY,
+        REVERSE_ACQUISITION_FUNCTION_REGISTRY,
+    )
+    key = qNegIntegratedPosteriorVariance.__name__
+    ACQUISITION_FUNCTION_REGISTRY.setdefault(qNegIntegratedPosteriorVariance, key)
+    REVERSE_ACQUISITION_FUNCTION_REGISTRY.setdefault(key, qNegIntegratedPosteriorVariance)
+
+
+# Default number of Sobol initialization trials for a model campaign when the
+# spec does not set one. BoTorch needs at least a few points to fit a surrogate.
+_DEFAULT_MODEL_SOBOL_TRIALS = 5
+
+
+def _build_model_generation_strategy(seed: Optional[int], sobol_trials: int) -> Any:
+    """Build the active-learning generation strategy: a Sobol initialization node
+    followed by a BoTorch node whose acquisition function is
+    qNegIntegratedPosteriorVariance (qNIPV).
+
+    qNIPV proposes points that reduce the surrogate's posterior variance over the
+    whole space (pure exploration), rather than chasing an optimum. The MC points
+    qNIPV integrates over are drawn by BoTorch's input constructor from the
+    model's transformed-space bounds, so no mc_points are supplied here.
+    """
+    from ax.generation_strategy.generation_strategy import GenerationStrategy
+    from ax.generation_strategy.generation_node import GenerationNode
+    from ax.generation_strategy.generator_spec import GeneratorSpec
+    from ax.generation_strategy.transition_criterion import MinTrials
+    from ax.adapter.registry import Generators
+    from botorch.acquisition.active_learning import qNegIntegratedPosteriorVariance
+
+    sobol = GenerationNode(
+        name="Sobol",
+        generator_specs=[GeneratorSpec(
+            generator_enum=Generators.SOBOL,
+            generator_kwargs={"seed": seed},
+        )],
+        transition_criteria=[MinTrials(
+            threshold=sobol_trials, transition_to="ActiveLearning",
+        )],
+    )
+    active = GenerationNode(
+        name="ActiveLearning",
+        generator_specs=[GeneratorSpec(
+            generator_enum=Generators.BOTORCH_MODULAR,
+            generator_kwargs={"botorch_acqf_class": qNegIntegratedPosteriorVariance},
+        )],
+    )
+    return GenerationStrategy(name="active-learning", nodes=[sobol, active])
 
 
 def _emit(msg: dict) -> None:
@@ -209,21 +279,34 @@ class AxDriver:
         seed = spec.get("seed")
         sobol_trials = spec.get("sobol_trials")
 
+        mode = spec.get("mode", "optimize")
+
         self._client = self._Client()
         self._client.configure_experiment(
             name="knit_ax",
             parameters=self._parameters(spec.get("parameters", [])),
         )
-        # The objective string encodes the sense: a leading "-" minimizes.
+        # The objective is declared in both modes. In optimize mode its sense
+        # drives the search (a leading "-" minimizes); in model mode the sense is
+        # ignored (qNIPV explores the whole space), but the metric is still the
+        # one the surrogate models.
         self._client.configure_optimization(
             objective=f"-{self._obj_name}" if self._minimize else self._obj_name
         )
-        gs_kwargs: dict = {}
-        if seed is not None:
-            gs_kwargs["initialization_random_seed"] = int(seed)
-        if sobol_trials is not None:
-            gs_kwargs["initialization_budget"] = int(sobol_trials)
-        self._client.configure_generation_strategy(**gs_kwargs)
+        if mode == "model":
+            n_sobol = int(sobol_trials) if sobol_trials is not None \
+                else _DEFAULT_MODEL_SOBOL_TRIALS
+            gs = _build_model_generation_strategy(
+                int(seed) if seed is not None else None, n_sobol,
+            )
+            self._client.set_generation_strategy(generation_strategy=gs)
+        else:
+            gs_kwargs: dict = {}
+            if seed is not None:
+                gs_kwargs["initialization_random_seed"] = int(seed)
+            if sobol_trials is not None:
+                gs_kwargs["initialization_budget"] = int(sobol_trials)
+            self._client.configure_generation_strategy(**gs_kwargs)
 
         self._observations = {}
         self._trial_params = {}
@@ -291,6 +374,78 @@ class AxDriver:
             "n_trials": self._n_trials(),
         })
 
+    def cmd_predict(self, req: dict) -> None:
+        points = req.get("points", [])
+        # predict is a read-only query: fit the current surrogate on the told
+        # data WITHOUT generating a trial. Every predict runs in a fresh process
+        # that resumed the campaign from disk, so the generation strategy's
+        # adapter is not built yet; predict would then fail with "not
+        # predictive". fit() builds the adapter from the experiment's data, for
+        # a model campaign (qNIPV node) and an optimize campaign (BoTorch node)
+        # alike. With too few trials to fit a surrogate it raises, which is the
+        # honest signal that the model is not ready.
+        try:
+            self._client._generation_strategy.fit(
+                experiment=self._client._experiment
+            )
+            preds = self._client.predict(points=points)
+        except Exception as exc:
+            raise RuntimeError(
+                f"the surrogate model cannot predict yet ({exc}); "
+                "run more trials with 'ax optimize'"
+            ) from exc
+        out: List[dict] = []
+        for pred in preds:
+            out.append({
+                metric: {"mean": float(mean), "sem": float(sem)}
+                for metric, (mean, sem) in pred.items()
+            })
+        self._send({"predictions": out})
+
+    def cmd_diagnostics(self, _req: dict) -> None:
+        # Surrogate fit quality by leave-one-out cross-validation. Every
+        # diagnostics call resumes from disk in a fresh process, so fit the
+        # adapter first (a bare load does not build it), then cross-validate.
+        # R^2 and RMSE are computed from the held-out fold predictions of the
+        # objective metric rather than read from a named diagnostic, so the
+        # numbers are the familiar coefficient of determination and root mean
+        # squared error.
+        from ax.adapter.cross_validation import cross_validate
+        try:
+            gs = self._client._generation_strategy
+            gs.fit(experiment=self._client._experiment)
+            adapter = gs.adapter
+            if adapter is None:
+                raise RuntimeError("the surrogate model is not fitted")
+            cv_results = cross_validate(adapter)
+        except Exception as exc:
+            raise RuntimeError(
+                f"cross-validation is not possible yet ({exc}); "
+                "run more trials with 'ax optimize'"
+            ) from exc
+
+        observed: List[float] = []
+        predicted: List[float] = []
+        for cv in cv_results:
+            obs = cv.observed.data.means_dict.get(self._obj_name)
+            pred = cv.predicted.means_dict.get(self._obj_name)
+            if obs is None or pred is None:
+                continue
+            observed.append(float(obs))
+            predicted.append(float(pred))
+
+        n = len(observed)
+        if n == 0:
+            raise RuntimeError("cross-validation produced no comparable points")
+        mean_obs = sum(observed) / n
+        ss_res = sum((o - p) ** 2 for o, p in zip(observed, predicted))
+        ss_tot = sum((o - mean_obs) ** 2 for o in observed)
+        # R^2 is undefined when every observation is identical (no variance to
+        # explain); report null there rather than dividing by zero.
+        r2: Optional[float] = (1.0 - ss_res / ss_tot) if ss_tot > 0 else None
+        rmse = (ss_res / n) ** 0.5
+        self._send({"diagnostics": {"n": n, "r2": r2, "rmse": rmse}})
+
     def cmd_save(self, req: dict) -> None:
         path = req["path"]
         Path(path).parent.mkdir(parents=True, exist_ok=True)
@@ -312,6 +467,8 @@ class AxDriver:
             "ask": self.cmd_ask,
             "tell": self.cmd_tell,
             "best": self.cmd_best,
+            "predict": self.cmd_predict,
+            "diagnostics": self.cmd_diagnostics,
             "save": self.cmd_save,
             "shutdown": self.cmd_shutdown,
         }

@@ -7,6 +7,10 @@ app already registered with Knit: the plugin probes the declared parameter
 domains, drives Ax's Sobol initialization and GP-EI loop, and records every
 trial and the final optimum in the Knit database for full reproducibility.
 
+The plugin can also fit a **surrogate model** of the objective instead of
+searching for its optimum (see "Build a surrogate model" below). You then predict
+the objective at new points with `ax predict`.
+
 ## Requirements
 
 - A `knit.sh` build that includes the **Phase-A public search-core API**
@@ -47,8 +51,11 @@ it). Two commands drive it, mirroring `prepare` then `submit drain`:
   when `--trials` bounds the call, a single campaign bar otherwise.
 - `ax extend --campaign <name> --max-trials <N>` raises a campaign's lifetime
   budget (never below the trials already run) so `ax optimize` can search further.
+- `ax predict --campaign <name> [OUTPUT FLAGS] -- <same command>` asks the fitted
+  model for the objective at a point you choose (see "Build a surrogate model").
 - `ax list` and `ax show --campaign <name>` report progress and the current best
-  from the campaign directory (no Ax process, no database).
+  from the campaign directory (no Ax process, no database). `ax show --diagnostics`
+  also reports the surrogate's cross-validated fit quality (R² / RMSE).
 
 ### Optimize a job over its declared space
 
@@ -101,6 +108,76 @@ objective is read from the app's own table:
 knit ax prepare --campaign bench-tune --objective throughput --maximize \
     --max-trials 40 -- run --procs 8 -- bench --msg-size @domain --algo @domain
 knit ax optimize --campaign bench-tune
+```
+
+## Build a surrogate model
+
+Sometimes you do not want the best point. You want to know how the objective
+behaves across the whole space. Give `--model` to `ax prepare` in place of
+`--minimize` / `--maximize`. The campaign then fits a **surrogate model** by
+active learning: each trial goes where the model is least sure, so the trials
+reduce the model's uncertainty across the space instead of chasing an optimum.
+`--model` cannot be used together with `--minimize` or `--maximize`, and the
+campaign keeps no "best".
+
+```bash
+knit ax prepare --campaign surface --objective val-loss --model \
+    --max-trials 40 -- submit -- train --lr @domain --batch-size @domain
+knit ax optimize --campaign surface        # spend the budget on active learning
+```
+
+`ax optimize` runs a model campaign the same way as an optimize campaign. Because
+a model campaign has no optimum, `ax show` reports the varying axes in place of a
+best — the axes also tell you the command shape `ax predict` expects:
+
+```
+knit ax show --campaign surface
+...
+axes:       train.lr, train.batch_size
+```
+
+### Predict the objective at a point
+
+`ax predict` asks the fitted model for the objective at a point you choose. Write
+the point as the same command you prepared, but with a concrete in-space value in
+each varying position:
+
+```bash
+knit ax predict --campaign surface -- submit -- train --lr 0.01 --batch-size 64
+0.183
+```
+
+The command must match the campaign's command, except at the varying positions,
+where you give a concrete value. A different command shape, a changed fixed
+argument, or a value outside its domain is an error. A value is "in space" when it
+is a member of a `{...}` set or inside a `[lo..hi]` range.
+
+By default `ax predict` prints the predicted value. Add detail with flags you can
+combine: `--variance`, `--std`, `--interval` (the 95% confidence interval), and
+`--json` (a structured object with the mean, sem, variance, and interval):
+
+```bash
+knit ax predict --campaign surface --std --interval -- submit -- train --lr 0.01 --batch-size 64
+0.183  (±0.021, 95% CI 0.142–0.224)
+```
+
+`ax predict` works on any campaign that has run trials — a `--model` campaign, or a
+`--minimize` / `--maximize` one. Away from its optimum an optimize campaign's model
+is simply less sure, which the standard error reports honestly. `ax predict` reads
+the model only; it records nothing.
+
+### Check the model fit
+
+`ax show --diagnostics` cross-validates the fitted surrogate and reports its fit
+quality: the coefficient of determination (R²) and the root mean squared error
+(RMSE). It refits the model, so it is opt-in:
+
+```
+knit ax show --campaign surface --diagnostics
+...
+diagnostics:
+  cross-val R^2:  0.94  (40 folds)
+  cross-val RMSE: 0.021
 ```
 
 ## License

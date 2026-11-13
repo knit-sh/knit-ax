@@ -38,6 +38,7 @@ teardown() {
     [[ "$output" == *"--objective"* ]]
     [[ "$output" == *"--minimize"* ]]
     [[ "$output" == *"--maximize"* ]]
+    [[ "$output" == *"--model"* ]]
     [[ "$output" == *"--max-trials"* ]]
     [[ "$output" == *"--seed"* ]]
     [[ "$output" == *"--on-failure"* ]]

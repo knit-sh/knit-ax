@@ -39,6 +39,24 @@ SPEC_1D = {
 }
 
 
+# Same 1-D space, model (active-learning) mode: qNIPV fits a surrogate of y
+# rather than optimizing it. sobol_trials bounds the quasi-random init.
+SPEC_MODEL = {
+    "objective": {"name": "y", "minimize": True},
+    "mode": "model",
+    "seed": 7,
+    "sobol_trials": 3,
+    "parameters": [
+        {
+            "name": "x",
+            "ax": "range",
+            "value_type": "float",
+            "bounds": [-5.0, 5.0],
+        }
+    ],
+}
+
+
 def _objective(params: dict) -> float:
     return (params["x"] - 2.0) ** 2
 
@@ -84,8 +102,8 @@ class DriverProcess:
             raise EOFError("driver closed stdout unexpectedly")
         return json.loads(raw)
 
-    def init(self, state_path: str = "") -> dict:
-        req: dict = {"cmd": "init", "spec": SPEC_1D}
+    def init(self, state_path: str = "", spec: Optional[dict] = None) -> dict:
+        req: dict = {"cmd": "init", "spec": spec if spec is not None else SPEC_1D}
         if state_path:
             req["state_path"] = state_path
         return self.send(req)
@@ -392,6 +410,193 @@ class TestAxProtocol(unittest.TestCase):
             assert dp.proc is not None
             dp.proc.wait(timeout=2)
             self.assertEqual(dp.proc.returncode, 0)
+
+
+class TestAxModelMode(unittest.TestCase):
+    """Model (active-learning) mode: init/ask/tell/resume with the qNIPV
+    generation strategy. The driver protocol is mode-agnostic beyond init, so
+    these mirror the optimize-mode protocol tests with a mode="model" spec."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        reason = _ax_unavailable_reason()
+        if reason:
+            raise unittest.SkipTest(f"ax-platform not available: {reason}")
+        cls.tmpdir = tempfile.mkdtemp(prefix="knit_ax_model_test_")
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        import shutil
+        shutil.rmtree(cls.tmpdir, ignore_errors=True)
+
+    def test_model_init_ok(self) -> None:
+        with DriverProcess() as dp:
+            resp = dp.init(spec=SPEC_MODEL)
+            self.assertEqual(resp.get("status"), "ok", resp)
+            self.assertEqual(resp.get("n_trials"), 0, resp)
+
+    def test_model_ask_tell(self) -> None:
+        with DriverProcess() as dp:
+            dp.init(spec=SPEC_MODEL)
+            ask = dp.send({"cmd": "ask", "n": 1})
+            self.assertEqual(len(ask["trials"]), 1, ask)
+            trial = ask["trials"][0]
+            x = trial["params"]["x"]
+            self.assertGreaterEqual(x, -5.0)
+            self.assertLessEqual(x, 5.0)
+            resp = dp.send({
+                "cmd": "tell",
+                "index": trial["index"],
+                "objective": _objective(trial["params"]),
+                "status": "ok",
+            })
+            self.assertEqual(resp.get("status"), "ok", resp)
+
+    def test_model_engages_active_learning_node(self) -> None:
+        """Asking past the Sobol budget exercises the qNIPV (ActiveLearning)
+        node: every proposed point stays in bounds and the trial indices are
+        distinct, so the surrogate node keeps producing valid candidates."""
+        with DriverProcess() as dp:
+            dp.init(spec=SPEC_MODEL)  # sobol_trials = 3
+            seen: list[int] = []
+            for _ in range(5):  # 3 Sobol + 2 from the active-learning node
+                ask = dp.send({"cmd": "ask", "n": 1})
+                trial = ask["trials"][0]
+                seen.append(trial["index"])
+                x = trial["params"]["x"]
+                self.assertGreaterEqual(x, -5.0)
+                self.assertLessEqual(x, 5.0)
+                dp.send({"cmd": "tell", "index": trial["index"],
+                          "objective": _objective(trial["params"]), "status": "ok"})
+            self.assertEqual(len(seen), len(set(seen)), f"duplicate indices: {seen}")
+
+    def test_model_resume_continues(self) -> None:
+        """A model campaign resumes from its saved state (which carries the
+        custom qNIPV strategy) and keeps proposing fresh trials."""
+        state = os.path.join(self.tmpdir, "model_resume.json")
+        seen: list[int] = []
+        with DriverProcess() as dp:
+            dp.init(state_path=state, spec=SPEC_MODEL)
+            for _ in range(4):
+                ask = dp.send({"cmd": "ask", "n": 1})
+                trial = ask["trials"][0]
+                seen.append(trial["index"])
+                dp.send({"cmd": "tell", "index": trial["index"],
+                          "objective": _objective(trial["params"]), "status": "ok"})
+            dp.send({"cmd": "save", "path": state})
+
+        with DriverProcess() as dp:
+            resp = dp.send({"cmd": "resume", "path": state, "state_path": state})
+            self.assertEqual(resp.get("status"), "ok", resp)
+            self.assertEqual(resp.get("n_trials"), 4, resp)
+            for _ in range(2):
+                ask = dp.send({"cmd": "ask", "n": 1})
+                trial = ask["trials"][0]
+                seen.append(trial["index"])
+                dp.send({"cmd": "tell", "index": trial["index"],
+                          "objective": _objective(trial["params"]), "status": "ok"})
+        self.assertEqual(len(seen), len(set(seen)),
+                         f"duplicate trial indices after resume: {seen}")
+
+
+class TestAxPredict(unittest.TestCase):
+    """The predict command over a fitted surrogate, for a model campaign and an
+    optimize campaign alike. Every predict resumes from saved state in a fresh
+    process (as "ax predict" does), so these also prove the driver fits the
+    surrogate on the told data before predicting — the adapter is not built by a
+    bare load."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        reason = _ax_unavailable_reason()
+        if reason:
+            raise unittest.SkipTest(f"ax-platform not available: {reason}")
+        cls.tmpdir = tempfile.mkdtemp(prefix="knit_ax_predict_test_")
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        import shutil
+        shutil.rmtree(cls.tmpdir, ignore_errors=True)
+
+    def _run_and_save(self, spec: dict, state: str, n: int = 6) -> None:
+        with DriverProcess() as dp:
+            dp.init(state_path=state, spec=spec)
+            for _ in range(n):
+                ask = dp.send({"cmd": "ask", "n": 1})
+                trial = ask["trials"][0]
+                dp.send({"cmd": "tell", "index": trial["index"],
+                          "objective": _objective(trial["params"]), "status": "ok"})
+            dp.send({"cmd": "save", "path": state})
+
+    def _assert_prediction(self, resp: dict, metric: str) -> None:
+        self.assertIn("predictions", resp, resp)
+        self.assertEqual(len(resp["predictions"]), 1, resp)
+        row = resp["predictions"][0]
+        self.assertIn(metric, row, row)
+        self.assertIsInstance(row[metric]["mean"], float)
+        self.assertIsInstance(row[metric]["sem"], float)
+        self.assertGreaterEqual(row[metric]["sem"], 0.0)
+
+    def test_predict_model_resume(self) -> None:
+        state = os.path.join(self.tmpdir, "predict_model.json")
+        self._run_and_save(SPEC_MODEL, state)
+        with DriverProcess() as dp:
+            dp.send({"cmd": "resume", "path": state, "state_path": state})
+            resp = dp.send({"cmd": "predict", "points": [{"x": 2.0}]})
+        self._assert_prediction(resp, "y")
+
+    def test_predict_optimize_resume(self) -> None:
+        state = os.path.join(self.tmpdir, "predict_opt.json")
+        self._run_and_save(SPEC_1D, state)
+        with DriverProcess() as dp:
+            dp.send({"cmd": "resume", "path": state, "state_path": state})
+            resp = dp.send({"cmd": "predict", "points": [{"x": 2.0}]})
+        self._assert_prediction(resp, "y")
+
+    def test_predict_near_optimum_is_small(self) -> None:
+        """objective = (x-2)^2; the surrogate's predicted mean near x=2 is well
+        below its value at the bounds (~9 at x=-5), a sanity check that predict
+        reflects the told data rather than returning noise."""
+        state = os.path.join(self.tmpdir, "predict_acc.json")
+        self._run_and_save(SPEC_MODEL, state, n=8)
+        with DriverProcess() as dp:
+            dp.send({"cmd": "resume", "path": state, "state_path": state})
+            resp = dp.send({"cmd": "predict", "points": [{"x": 2.0}]})
+        mean = resp["predictions"][0]["y"]["mean"]
+        self.assertLess(mean, 4.0, resp)
+
+    def test_predict_out_of_space_errors(self) -> None:
+        state = os.path.join(self.tmpdir, "predict_oob.json")
+        self._run_and_save(SPEC_MODEL, state)
+        with DriverProcess() as dp:
+            dp.send({"cmd": "resume", "path": state, "state_path": state})
+            resp = dp.send({"cmd": "predict", "points": [{"x": 99.0}]})
+        self.assertIn("error", resp, resp)
+
+    def _assert_diagnostics(self, resp: dict) -> None:
+        self.assertIn("diagnostics", resp, resp)
+        diag = resp["diagnostics"]
+        self.assertGreater(diag["n"], 0, resp)
+        self.assertIsInstance(diag["rmse"], float)
+        self.assertGreaterEqual(diag["rmse"], 0.0)
+        # r2 may be null only when the objective is constant; it is not here.
+        self.assertIsInstance(diag["r2"], float)
+
+    def test_diagnostics_model_resume(self) -> None:
+        state = os.path.join(self.tmpdir, "diag_model.json")
+        self._run_and_save(SPEC_MODEL, state, n=8)
+        with DriverProcess() as dp:
+            dp.send({"cmd": "resume", "path": state, "state_path": state})
+            resp = dp.send({"cmd": "diagnostics"})
+        self._assert_diagnostics(resp)
+
+    def test_diagnostics_optimize_resume(self) -> None:
+        state = os.path.join(self.tmpdir, "diag_opt.json")
+        self._run_and_save(SPEC_1D, state, n=8)
+        with DriverProcess() as dp:
+            dp.send({"cmd": "resume", "path": state, "state_path": state})
+            resp = dp.send({"cmd": "diagnostics"})
+        self._assert_diagnostics(resp)
 
 
 if __name__ == "__main__":
