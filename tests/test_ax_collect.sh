@@ -12,18 +12,18 @@ setup() {
     # A job target (submit mode): declares val_loss in its own table.
     knit_register "submit__1__train" knit_empty "Training job (submit)."
     knit_with_optional "lr:real"       "0.01" "learning rate" --domain '[1e-5..1.0]'
-    knit_with_output   "val_loss:real" ""     "validation loss"
+    knit_with_output   "val_loss:real" "validation loss"
     knit_with_table    "train"
     knit_done
     # An app target (run mode): declares throughput in its own table.
     knit_register "run__1__bench" knit_empty "Bench app (run)."
     knit_with_optional "msg_size:integer" "64" "message size" --domain '{64,128}'
-    knit_with_output   "throughput:real"  ""   "throughput"
+    knit_with_output   "throughput:real"  "throughput"
     knit_with_table    "bench"
     knit_done
     # A target that declares a hyphenated output (column folds to underscores).
     knit_register "submit__1__hyp" knit_empty "Hyphen-output job."
-    knit_with_output "val-loss:real" "" "validation loss"
+    knit_with_output "val-loss:real" "validation loss"
     knit_with_table  "hyp"
     knit_done
 }

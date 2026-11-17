@@ -27,7 +27,7 @@ setup() {
     knit_with_optional "x:real" "" "x knob" --domain '[0..12]'
     knit_with_optional "y:real" "5" "fixed y"
     knit_with_table    "train"
-    knit_with_output   "score:real" "" "surrogate score"
+    knit_with_output   "score:real" "surrogate score"
     knit_done
 
     _install_predict_seams

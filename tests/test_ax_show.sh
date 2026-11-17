@@ -22,7 +22,7 @@ setup() {
     knit_register "submit__1__train" knit_empty "Surrogate training job."
     knit_with_optional "x:real" "" "x knob" --domain '[0..12]'
     knit_with_table    "train"
-    knit_with_output   "score:real" "" "surrogate score"
+    knit_with_output   "score:real" "surrogate score"
     knit_done
 
     _install_show_seams

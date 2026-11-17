@@ -16,7 +16,7 @@ setup() {
     knit_with_optional "optimizer:string" "sgd" "optimizer"
     knit_with_optional "epochs:integer" "10"   "epochs"
     knit_with_optional "dropout:real"   "0.0"  "dropout"
-    knit_with_output   "val_loss:real"  ""     "validation loss"
+    knit_with_output   "val_loss:real"  "validation loss"
     knit_done
     # Register a "submit__1__train" variant for submit-mode tests.
     knit_register "submit__1__train" knit_empty "Training job (submit)."
@@ -25,30 +25,30 @@ setup() {
     knit_with_optional "epochs:integer" "10"   "epochs"
     # "nodes" collides by name with the submit dispatcher's own --nodes.
     knit_with_optional "nodes:integer"  "1"    "graph node count" --domain '{1,2,4,8}'
-    knit_with_output   "val_loss:real"  ""     "validation loss"
+    knit_with_output   "val_loss:real"  "validation loss"
     knit_done
     # Register a no-domain command for the "no varying parameter" test.
     knit_register "fixedcmd" knit_empty "All-fixed command."
     knit_with_optional "x:real"    "0.0" "x-value"
     knit_with_optional "y:integer" "1"   "y-value"
-    knit_with_output   "z:real"    ""    "output"
+    knit_with_output   "z:real"    "output"
     knit_done
     # Register a command with a non-numeric output for the objective-type test.
     knit_register "labeler" knit_empty "String-output command."
     knit_with_optional "x:real" "0" "x" --domain '[0..1]'
-    knit_with_output   "label:string" "" "predicted label"
+    knit_with_output   "label:string" "predicted label"
     knit_done
     # A command with a glob domain (config) plus a plain string param (data) that
     # a glob token is given to explicitly, for the @glob paths.
     knit_register "globcmd" knit_empty "Command with a glob domain."
     knit_with_optional "config:string" "default.yaml" "config file" --domain '@glob:*.glomtest'
     knit_with_optional "data:string"   "d"            "data file"
-    knit_with_output   "val_loss:real" ""             "validation loss"
+    knit_with_output   "val_loss:real" "validation loss"
     knit_done
     # A command whose glob domain matches nothing in the fixture directory.
     knit_register "globnomatch" knit_empty "Command whose glob domain matches nothing."
     knit_with_optional "config:string" "x" "config file" --domain '@glob:*.nomatch_xyz'
-    knit_with_output   "val_loss:real" "" "validation loss"
+    knit_with_output   "val_loss:real" "validation loss"
     knit_done
     # A fixture directory holding the files the glob tests match. Bats runs each
     # test in its own subshell, so a test may cd here without disturbing others.

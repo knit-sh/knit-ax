@@ -21,7 +21,7 @@ setup() {
     knit_register "submit__1__train" knit_empty "Training job (submit)."
     knit_with_optional "lr:real" "0.01" "learning rate" --domain '[1e-5..1.0]' --log
     knit_with_table    "train"
-    knit_with_output   "val_loss:real" "" "validation loss"
+    knit_with_output   "val_loss:real" "validation loss"
     knit_done
     knit ax prepare --campaign demo --objective val_loss --minimize \
         --max-trials 8 --seed 1 -- submit -- train --lr @domain

@@ -22,7 +22,7 @@ setup() {
     knit_with_optional "lr:real"        "0.01" "learning rate" --domain '[1e-5..1.0]' --log
     knit_with_optional "epochs:integer" "10"   "epochs"
     knit_with_table    "train"
-    knit_with_output   "val_loss:real"  ""     "validation loss"
+    knit_with_output   "val_loss:real"  "validation loss"
     knit_done
 }
 

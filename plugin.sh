@@ -313,13 +313,14 @@ _knit_ax_discover() {
     knit_with_table "optimizations"
     # Programmatic output columns: set at prepare (sense/status) and updated by
     # "ax optimize" on the same row as the campaign progresses.
-    knit_with_output "sense:ax_sense" "" \
+    knit_with_output "sense:ax_sense" \
         "Optimization sense: minimize or maximize."
-    knit_with_output "status:string" "" \
-        "Campaign status: prepared, running, completed, or failed."
-    knit_with_output "best_id:string" "" \
+    knit_with_output "status:string" \
+        "Campaign status: prepared, running, completed, or failed." \
+        --unset "<unknown>"
+    knit_with_output "best_id:string" \
         "Row id of the best trial."
-    knit_with_output "best_objective:real" "" \
+    knit_with_output "best_objective:real" \
         "Objective value of the best trial."
     knit_done
 
